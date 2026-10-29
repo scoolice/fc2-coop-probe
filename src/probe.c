@@ -730,7 +730,8 @@ static void ent_place(BYTE *ent, const float *pos, float yaw)
     ((setvec_t)(g_base + RVA_SETPOSITION))(ent, pos[0], pos[1], pos[2]);
 }
 
-/* vinfo <id> | vphys <id> 0|1 | vset <id> <x> <y> <z> <yaw radians> */
+/* vinfo <id> | vphys <id> 0|1 | vset <id> <x> <y> <z> <yaw radians> | getc <id> <getter rva hex>: calls a
+ * GetComponent<T> getter (thiscall on the entity, e.g. 90930 = CPawnNetworkComponent) and logs the component */
 static int veh_cmd(const char *ln)
 {
     unsigned long long id;
@@ -738,6 +739,19 @@ static int veh_cmd(const char *ln)
     BYTE *ent;
     float v[4];
     int on;
+    unsigned long rva;
+    if (sscanf(ln, "getc %llu %lx", &id, &rva) == 2) {
+        void *c;
+        ent = entity_obj(id, &holder);
+        if (!ent || IsBadReadPtr(ent, 0x70)) logf_("getc %llu: no entity", id);
+        else {
+            c = ((getvehphys_t)(g_base + rva))(ent);
+            logf_("getc %llu %lx: entity %p vtable rva %lx -> component %p vtable rva %lx", id, rva, ent,
+                  (unsigned long)(*(BYTE **)ent - g_base), c, c && !IsBadReadPtr(c, 4) ? (unsigned long)(*(BYTE **)c - g_base) : 0UL);
+        }
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        return 1;
+    }
     if (sscanf(ln, "vinfo %llu", &id) != 1 && sscanf(ln, "vphys %llu %d", &id, &on) != 2 &&
         sscanf(ln, "vset %llu %f %f %f %f", &id, &v[0], &v[1], &v[2], &v[3]) != 5) return 0;
     ent = entity_obj(id, &holder);
