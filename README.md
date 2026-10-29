@@ -93,8 +93,11 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `sig <pawn> <name\|0xhash>` | Send a signal (crc32 of its name) to the pawn's state driver, as the player's input does (`config/inputactionmapcommon.xml`: `startshooting`, `reload`, `jump`, ...). On an AI pawn `startshooting` does nothing |
 | `wbullet <pawn> [entity]` | Fire one bullet from the gun in the pawn's hand: a `shootbullet` animation event handed to its bullet fire strategy. The bullet follows the pawn's aim |
 | `wfire <pawn> <dx> <dy> <dz>` | Like `wbullet`, along the given direction (test: the buddy's bullets do damage enemies) |
-| `wmute <pawn\|0>` | Test: drop that pawn's own bullets (only `wbullet`/`wfire` and the peer's synced shots go out), skip its weapon's start-shooting step and its AI's fire input; logs its AI state changes and the call path of its first 3 own bullets. 0 turns it off |
+| `wmute <pawn\|0>` | Test: that pawn's gun does not fire on its own: its weapon manager's fire-one-shot step (Dunia+0x1305f0) and start-shooting step are skipped and any own bullet is dropped (only `wbullet`/`wfire` and the peer's synced shots go out). Logs its AI state changes and the call path of its first 3 own bullets. 0 turns it off |
 | `wmutebit <n>` | Test: never set bit `n` of the muted pawn's AI state mask (-1 = none). Bit 0x32 follows its bursts but holding it does not stop the firing |
+| `waim <pawn> <x> <y> <z> [or4 or6 or7]` / `waim 0` | Test: after each update of the pawn, set aim flags in its control block (pawn data + 0x140; default +4\|03 AimAt+LookAt, +6\|04, +7\|01) and the aim point. The pawn then points its gun at its feet: these fields alone do not give an aim pose |
+| `waimat <pawn> <entity>` | Like `waim`, with the entity as the aim target (block +0x18c, +6\|84). Same result: gun at its feet |
+| `hwbp <hex address\|0>` / `hwlog` | Hardware write breakpoint (debug register 0, one byte) on every game thread; `hwlog` lists the instructions that wrote it and how often. `hwbp 0` clears it and keeps the counts |
 | `getc <id> <rva>` | Call a `GetComponent<T>` getter (thiscall on the entity, RVA in hex) and log the component and its vtable RVA. `90930` is `CPawnNetworkComponent`: null on the campaign player, a spawned buddy and a vehicle, so the multiplayer third-party path cannot be switched on for campaign pawns as they are; `649f0` is the vehicle physics component |
 | `aistop` | Stop the follower and remove its marker |
 
@@ -322,10 +325,12 @@ the barrel pointing at the ground, so it is not used.
 Aiming is being worked on. `ShootAtTarget` (a Domino command) on a plain marker entity makes the
 buddy turn and aim at it at once, with the game's own pose, but he then fires on his own and nothing
 found so far ends that task (a stop signal, `MoveTo`, removing or killing the target, holstering).
-`wmute` drops such a pawn's own bullets and skips its weapon's start-shooting step (no muzzle flash, no
-shot sound), but its firing motion and reloads go on. A stack trace showed that the AI's gun fires
-through the weapon manager's fire-one-shot step (Dunia+0x1305f0), the same path as the player's gun;
-that is the next thing to hold for the buddy.
+A stack trace showed that the AI's gun fires through the weapon manager's fire-one-shot step
+(Dunia+0x1305f0), the same path as the player's gun. `wmute` skips that step for one pawn: then it
+aims, fires no bullet, makes no sound and does not reload, but its gun still jolts as if firing, and
+the task still cannot be ended. Writing the aim fields of the pawn's control block directly (`waim`,
+`waimat`, no shoot task) gives a broken pose, the gun pointing at the pawn's feet. The handoff notes
+in the private workspace have the full map of what was tried.
 
 ### Buddy rescue
 

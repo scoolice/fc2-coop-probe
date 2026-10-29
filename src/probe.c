@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
+#include <tlhelp32.h>
 
 static FILE *g_log;
 static CRITICAL_SECTION g_cs;
@@ -379,9 +380,50 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 WINBASEAPI PVOID WINAPI AddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
+/* hwbp: a hardware write breakpoint (debug register 0) on one byte, set on every thread of the game. Each write
+ * traps after the writing instruction; the handler only counts the instruction addresses, hwlog prints them. */
+static DWORD g_hw_addr, g_hw_eip[16], g_hw_cnt[16];
+static int g_hw_n;
+
+static DWORD WINAPI hw_set_threads(void *unused)
+{
+    THREADENTRY32 te;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    int n = 0;
+    (void)unused;
+    te.dwSize = sizeof te;
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        HANDLE h;
+        CONTEXT c;
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+        if (!(h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, te.th32ThreadID))) continue;
+        SuspendThread(h);
+        c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (GetThreadContext(h, &c)) {
+            c.Dr0 = g_hw_addr;
+            c.Dr7 = g_hw_addr ? (c.Dr7 & ~0xF0003u) | 0x10001u : c.Dr7 & ~0xF0003u;  /* L0, RW0 = write, LEN0 = 1 byte */
+            if (SetThreadContext(h, &c)) n++;
+        }
+        ResumeThread(h);
+        CloseHandle(h);
+    }
+    CloseHandle(snap);
+    return n;
+}
+
 static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
 {
     static int n;
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 1) && g_hw_addr) {
+        DWORD eip = ep->ContextRecord->Eip;
+        int i;
+        for (i = 0; i < g_hw_n && g_hw_eip[i] != eip; i++) ;
+        if (i < g_hw_n) g_hw_cnt[i]++;
+        else if (g_hw_n < 16) { g_hw_eip[g_hw_n] = eip; g_hw_cnt[g_hw_n++] = 1; }
+        ep->ContextRecord->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && n < 30) {
         char mod[96];
         n++;
@@ -495,7 +537,18 @@ static void native_cmd(const char *ln)
     unsigned long a, pv;
     float fx, fy, fz;
     int n;
-    if (sscanf(ln, "peek %lx %d", &a, &n) == 2) {
+    if (sscanf(ln, "hwbp %lx", &a) == 1) {
+        HANDLE t;
+        DWORD set = 0;
+        if (a) g_hw_n = 0;  /* clearing keeps the counts for hwlog */
+        g_hw_addr = a;
+        if ((t = CreateThread(NULL, 0, hw_set_threads, NULL, 0, NULL))) { WaitForSingleObject(t, 5000); GetExitCodeThread(t, &set); CloseHandle(t); }
+        logf_("hwbp %lx: set on %lu thread(s)%s", a, set, a ? "" : " (cleared)");
+    } else if (strcmp(ln, "hwlog") == 0) {
+        int i;
+        logf_("hwlog: %d writer(s)", g_hw_n);
+        for (i = 0; i < g_hw_n; i++) logf_("hwlog: after Dunia+0x%lx (%p) x%lu", g_hw_eip[i] - (DWORD)g_base, (void *)g_hw_eip[i], g_hw_cnt[i]);
+    } else if (sscanf(ln, "peek %lx %d", &a, &n) == 2) {
         if (IsBadReadPtr((void *)a, n)) logf_("peek %lx: unreadable", a);
         else hexdump_((const BYTE *)a, n);
     } else if (sscanf(ln, "ent %llu %d", &id, &n) == 2) {
@@ -1043,17 +1096,60 @@ static void __attribute__((thiscall)) h_agentbit(void *agent, int bit, int on)
     o_agentbit(agent, bit, on);
 }
 
+/* FUN_101305f0 (thiscall (weapon manager part, pawn component), RET 4) fires one shot of the gun in hand: the
+ * strategy's Fire (slot 8, then FUN_10113230 per pellet), recoil and the pawn's shooting signals. An AI pawn's gun
+ * fires this way too. Skipped for the muted pawn, so its AI can aim without firing. */
+#define RVA_FIRESHOT 0x1305f0
+typedef void (__attribute__((thiscall)) *fireshot_t)(void *self, void *pc);
+static fireshot_t o_fireshot;
+
+static void __attribute__((thiscall)) h_fireshot(void *self, void *pc)
+{
+    static unsigned n;
+    if (g_mute_id && pc && pc_entity_id(pc) == g_mute_id) { if (n++ % 50 == 0) logf_("shot: held %u shot(s) of %llu", n, g_mute_id); return; }
+    o_fireshot(self, pc);
+}
+
+/* FUN_10083be0 (thiscall (pawn data, a, b), RET 8) is the pawn data's per-frame update. Its control block
+ * (pawn data + 0x140) holds the AI's pose requests at +4: 0x01 AimAt, 0x02 LookAt, 0x08 IronSight (as set by
+ * CTaskSetPawnAttribute), and the aim step of CTaskShoot (FUN_109797e0) adds +6 0x04, +6 0x80 / +7 0x01 and the
+ * aim point at +0x7c. waim writes those for one pawn after each update, without any shoot task. */
+#define RVA_PAWNUPDATE 0x83be0
+typedef void (__attribute__((thiscall)) *pawnupd_t)(void *pd, void *a, void *b);
+static pawnupd_t o_pawnupd;
+static BYTE *g_aim_pd, *g_aim_holder;  /* g_aim_holder: aim target entity (block +0x18c), one reference kept */
+static float g_aim_pt[3];
+static unsigned g_aim_or4 = 0x03, g_aim_or6 = 0x04, g_aim_or7 = 0x01;
+
+static void __attribute__((thiscall)) h_pawnupd(void *pd, void *a, void *b)
+{
+    o_pawnupd(pd, a, b);
+    if (pd && pd == g_aim_pd) {
+        BYTE *blk = g_aim_pd + 0x140;
+        blk[4] |= (BYTE)g_aim_or4; blk[6] |= (BYTE)g_aim_or6; blk[7] |= (BYTE)g_aim_or7;
+        memcpy(blk + 0x7c, g_aim_pt, sizeof g_aim_pt);
+        if (g_aim_holder && *(BYTE **)(blk + 0x18c) != g_aim_holder) {
+            (*(int *)(g_aim_holder + 8))++;  /* the slot's reference; the one it replaces is left (test only) */
+            *(BYTE **)(blk + 0x18c) = g_aim_holder;
+        }
+    }
+}
+
 static void install_shot_hook(void)
 {
     static const BYTE sub8c[6] = { 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00 };  /* SUB ESP,0x8c */
     static const BYTE frame[6] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0 };  /* PUSH EBP; MOV EBP,ESP; AND ESP,-16 */
     static const BYTE sub1c[5] = { 0x83, 0xEC, 0x1C, 0x53, 0x56 };  /* SUB ESP,0x1c; PUSH EBX; PUSH ESI */
+    static const BYTE sub54[6] = { 0x83, 0xEC, 0x54, 0x0F, 0x57, 0xC0 };  /* SUB ESP,0x54; XORPS XMM0,XMM0 */
+    static const BYTE sub48[6] = { 0x83, 0xEC, 0x48, 0x53, 0x55, 0x56 };  /* SUB ESP,0x48; PUSH EBX; PUSH EBP; PUSH ESI */
     static const BYTE agbit[7] = { 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x08 };  /* PUSH ESI; MOV ESI,ECX; MOV ECX,[ESP+8] */
     BYTE sub38[8] = { 0x83, 0xEC, 0x38, 0xA1 };  /* SUB ESP,0x38; MOV EAX,[Dunia+0x1645a74] */
     void *p;
     *(BYTE **)(sub38 + 4) = g_base + 0x1645a74;
     if ((p = detour_checked(RVA_STARTSHOOT, sub38, 8, h_startshoot, "start shooting"))) o_startshoot = (startshoot_t)p;
     if ((p = detour_checked(RVA_AIFIRE, sub1c, 5, h_aifire, "AI fire"))) o_aifire = (aifire_t)p;
+    if ((p = detour_checked(RVA_FIRESHOT, sub54, 6, h_fireshot, "fire shot"))) o_fireshot = (fireshot_t)p;
+    if ((p = detour_checked(RVA_PAWNUPDATE, sub48, 6, h_pawnupd, "pawn update"))) o_pawnupd = (pawnupd_t)p;
     if ((p = detour_checked(RVA_AGENTBIT, agbit, 7, h_agentbit, "agent state"))) o_agentbit = (agentbit_t)p;
     if ((p = detour_checked(RVA_FIREBULLET, sub8c, 6, h_firebullet, "shot"))) o_firebullet = (firebullet_t)p;
     if ((p = detour_checked(RVA_AIM_PLAYER, frame, 6, h_aim_player, "player aim"))) o_aim_player = (aim_t)p;
@@ -1091,6 +1187,12 @@ static int wpn_cmd(const char *ln)
     int op;
     float fd[3];
     if (sscanf(ln, "wfire %llu %f %f %f", &id, &fd[0], &fd[1], &fd[2]) == 4) { op = 7; wid = id; }
+    else if (strcmp(ln, "waim 0") == 0) { g_aim_pd = NULL; g_aim_holder = NULL; logf_("waim: off"); return 1; }
+    else if (sscanf(ln, "waimat %llu %llu", &id, &wid) == 2) { op = 10; g_aim_or4 = 0x03; g_aim_or6 = 0x84; g_aim_or7 = 0x00; }
+    else if (sscanf(ln, "waim %llu %f %f %f", &id, &fd[0], &fd[1], &fd[2]) == 4) {
+        op = 9;
+        if (sscanf(ln, "waim %*u %*f %*f %*f %x %x %x", &g_aim_or4, &g_aim_or6, &g_aim_or7) != 3) { g_aim_or4 = 0x03; g_aim_or6 = 0x04; g_aim_or7 = 0x01; }
+    }
     else if (sscanf(ln, "sig %llu %47s", &id, cat) == 2) op = 5;
     else if (sscanf(ln, "wmutebit %i", &op) == 1) { g_mute_bit = op; logf_("wmutebit: agent bit 0x%x held", op); return 1; }
     else if (sscanf(ln, "wmute %llu", &id) == 1) { g_mute_id = id; g_muted = 0; g_mute_agent = NULL; logf_("wmute: %llu's own bullets %s", id, id ? "dropped" : "(none muted)"); return 1; }
@@ -1107,6 +1209,22 @@ static int wpn_cmd(const char *ln)
     if (!pc) { logf_("wpn %llu: no pawn component", id); goto done; }
     mgr = weapon_mgr(pc);
     m = *(BYTE **)(mgr + 4);
+    if (op == 10) {
+        void *th = NULL;
+        BYTE *t = entity_obj(wid, &th);
+        if (!t || !th) { logf_("waimat: no entity %llu", wid); if (th) (*(int *)((BYTE *)th + 8))--; goto done; }
+        g_aim_holder = th;  /* keeps the reference entity_obj took */
+        memcpy(g_aim_pt, t + 0x60, sizeof g_aim_pt);
+        g_aim_pd = *(BYTE **)((BYTE *)pc + 0x10);
+        logf_("waimat %llu: pawn data %p aims at entity %llu (holder %p)", id, g_aim_pd, wid, th);
+        goto done;
+    }
+    if (op == 9) {
+        memcpy(g_aim_pt, fd, sizeof fd);
+        g_aim_pd = *(BYTE **)((BYTE *)pc + 0x10);
+        logf_("waim %llu: pawn data %p aims at %.2f %.2f %.2f (+4|%02x +6|%02x +7|%02x)", id, g_aim_pd, fd[0], fd[1], fd[2], g_aim_or4, g_aim_or6, g_aim_or7);
+        goto done;
+    }
     if (op == 5) {
         unsigned h = strncmp(cat, "0x", 2) == 0 ? (unsigned)strtoul(cat, NULL, 16) : ((strhash_t)(g_base + RVA_STRHASH))(cat);
         pawn_signal(pc, h);
