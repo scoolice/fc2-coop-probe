@@ -42,7 +42,15 @@ function Say($m) { Write-Output ("[setup] " + $m) }
 # 1. game
 if (-not $GameDir) {
     $libs = @()
-    foreach ($s in "${env:ProgramFiles(x86)}\Steam", "$env:ProgramFiles\Steam") {
+    $steamRoots = @("${env:ProgramFiles(x86)}\Steam", "$env:ProgramFiles\Steam")
+    # Steam installed elsewhere (e.g. D:\Steam): its path is in the registry
+    foreach ($k in 'HKCU:\Software\Valve\Steam', 'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam') {
+        foreach ($v in 'SteamPath', 'InstallPath') {
+            $p = (Get-ItemProperty $k -Name $v -ErrorAction SilentlyContinue).$v
+            if ($p) { $steamRoots += ($p -replace '/', '\') }
+        }
+    }
+    foreach ($s in ($steamRoots | Select-Object -Unique)) {
         $vdf = Join-Path $s 'steamapps\libraryfolders.vdf'
         if (Test-Path $vdf) { $libs += $s; $libs += (Select-String -Path $vdf -Pattern '"path"\s+"([^"]+)"' | ForEach-Object { $_.Matches[0].Groups[1].Value -replace '\\\\', '\' }) }
     }

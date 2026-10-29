@@ -97,6 +97,8 @@ function StartRelay {
 try {
     foreach ($f in 'FarCry2.exe', 'Dunia.dll', 'dinput8.dll') { if (-not (Test-Path (Join-Path $bin $f))) { throw "no bin\$f in $TestDir" } }
     if (-not (Test-Path $SteamDll)) { throw "no $SteamDll" }
+    # the relay runs in steam-run, so a relative path would point inside it
+    $SteamDll = (Resolve-Path $SteamDll).Path
     # Before any Enter is pressed: the copy must have its own profile + save-list folder and that folder a save.
     # Otherwise Story Mode offers only New Story, and Enter would start a new game.
     $db = [IO.File]::ReadAllBytes((Join-Path $bin 'Dunia.dll'))
