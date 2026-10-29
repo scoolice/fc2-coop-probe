@@ -91,6 +91,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `winfo <pawn>` / `wadd <pawn> <weapon>` / `wsel <pawn> primary\|secondary\|hand_hand\|special` / `wdraw <pawn>` / `wholster <pawn>` | Weapons on any pawn: log its weapon manager (mode, state, weapon in hand); give it a spawned weapon entity; select a category (also draws); draw; holster |
 | `sig <pawn> <name\|0xhash>` | Send a signal (crc32 of its name) to the pawn's state driver, as the player's input does (`config/inputactionmapcommon.xml`: `startshooting`, `reload`, `jump`, ...). On an AI pawn `startshooting` does nothing |
 | `wbullet <pawn> [entity]` | Fire one bullet from the gun in the pawn's hand: a `shootbullet` animation event handed to its bullet fire strategy. Muzzle flash, no sound; the bullet follows the pawn's aim |
+| `wfire <pawn> <dx> <dy> <dz>` | Like `wbullet`, along the given direction (test: the buddy's bullets do damage enemies) |
 | `getc <id> <rva>` | Call a `GetComponent<T>` getter (thiscall on the entity, RVA in hex) and log the component and its vtable RVA. `90930` is `CPawnNetworkComponent`: null on the campaign player, a spawned buddy and a vehicle, so the multiplayer third-party path cannot be switched on for campaign pawns as they are; `649f0` is the vehicle physics component |
 | `aistop` | Stop the follower and remove its marker |
 
@@ -310,7 +311,9 @@ peer's. The bullet still starts at the buddy's muzzle, so it flies parallel to t
 Two copies, the player of A firing single shots, bursts, at the ground and at a car with the G3: the
 buddy in B fired along (41+ bullets), each with A's direction (for example -0.07 0.24 -0.97 for the
 shots at the ground, where his own aim was -0.71 -0.70 -0.01), and the owner saw them go the same way.
-The shots make no sound and the buddy's arms do not follow the aim. `LookAtTarget` turns him but leaves
+The bullets damage enemies: an enemy soldier 6 m away, kept on the spot with a `MoveTo` to a marker
+(`hold` does not keep a pawn in place), took damage from 5 `wfire` shots. The shots make no sound
+and the buddy's arms do not follow the aim. `LookAtTarget` turns him but leaves
 the barrel pointing at the ground, so it is not used.
 
 ## Automated two-copy test

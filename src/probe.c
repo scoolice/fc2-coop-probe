@@ -909,7 +909,12 @@ static void __attribute__((thiscall)) h_firebullet(void *strat, void *arg, void 
     unsigned long long who = 0;
     BYTE *h, *e;
     if (arg && (h = *(BYTE **)((BYTE *)arg + 8)) && (e = *(BYTE **)(h + 0xC))) who = *(unsigned long long *)(e + 8);
-    if (g_shotlog < 10) { g_shotlog++; logf_("shot: bullet from entity %llu (strategy %p)", who, strat); }
+    if (g_shotlog < 30) {
+        BYTE *s = strat;
+        g_shotlog++;
+        logf_("shot: bullet from entity %llu (strategy %p) +134=%d +100=%d +14c=%.3f args %p %p %p", who, strat,
+              *(int *)(s + 0x134), *(BYTE *)(s + 0x100), *(float *)(s + 0x14C), b, c, d);
+    }
     if (g_net_id && who == g_net_id) InterlockedIncrement(&g_shots);
     o_firebullet(strat, arg, b, c, d);
 }
@@ -925,6 +930,8 @@ static aim_t o_aim_player, o_aim_other;
 static float g_aim_dir[3];  /* direction of the local player's last bullet */
 static float g_peer_aim[3];  /* the peer's, used for the body's bullets when non-zero */
 static unsigned long long g_ai_id;  /* the AI body (defined with the AI state below) */
+static unsigned long long g_force_id;  /* wfire: this pawn's next bullets take g_force_dir */
+static float g_force_dir[3];
 
 static unsigned long long pc_entity_id(void *pc)
 {
@@ -942,6 +949,7 @@ static void __attribute__((thiscall)) h_aim_other(void *strat, void *pc, float *
 {
     static int logged;
     o_aim_other(strat, pc, org, dir, pellet);
+    if (g_force_id && pc_entity_id(pc) == g_force_id) { memcpy(dir, g_force_dir, sizeof g_force_dir); return; }
     if (g_ai_id && pc_entity_id(pc) == g_ai_id && (g_peer_aim[0] != 0 || g_peer_aim[1] != 0 || g_peer_aim[2] != 0)) {
         if (logged < 10) {
             logged++;
@@ -986,7 +994,8 @@ static int weapon_bullet(void *pc, unsigned long long ent)
 }
 
 /* winfo <pawn> | wadd <pawn> <weapon entity> | wsel <pawn> <primary|secondary|hand_hand|special> | wdraw <pawn> |
- * wholster <pawn> | sig <pawn> <signal name, or 0x<hash>> | wbullet <pawn> [event entity, default the pawn] */
+ * wholster <pawn> | sig <pawn> <signal name, or 0x<hash>> | wbullet <pawn> [event entity, default the pawn] |
+ * wfire <pawn> <dx dy dz>: one bullet along that direction */
 static int wpn_cmd(const char *ln)
 {
     unsigned long long id, wid;
@@ -994,7 +1003,9 @@ static int wpn_cmd(const char *ln)
     void *holder = NULL, *pc;
     BYTE *ent, *mgr, *m;
     int op;
-    if (sscanf(ln, "sig %llu %47s", &id, cat) == 2) op = 5;
+    float fd[3];
+    if (sscanf(ln, "wfire %llu %f %f %f", &id, &fd[0], &fd[1], &fd[2]) == 4) { op = 7; wid = id; }
+    else if (sscanf(ln, "sig %llu %47s", &id, cat) == 2) op = 5;
     else if (sscanf(ln, "wbullet %llu %llu", &id, &wid) >= 1) { op = 7; if (sscanf(ln, "wbullet %llu %llu", &id, &wid) < 2) wid = id; }
     else if (sscanf(ln, "winfo %llu", &id) == 1) op = 0;
     else if (sscanf(ln, "wadd %llu %llu", &id, &wid) == 2) op = 1;
@@ -1016,8 +1027,11 @@ static int wpn_cmd(const char *ln)
     }
     if (!m || IsBadReadPtr(m, 0x80)) { logf_("wpn %llu: no weapon manager", id); goto done; }
     if (op == 7) {
-        int r = weapon_bullet(pc, wid);
-        logf_("wbullet %llu (event entity %llu): %s", id, wid, r == 1 ? "shootbullet handled" : r == 2 ? "event not handled" : r < 0 ? "weapon is not a bullet weapon" : "no weapon in hand");
+        int r, forced = ln[1] == 'f';
+        if (forced) { memcpy(g_force_dir, fd, sizeof fd); g_force_id = id; }
+        r = weapon_bullet(pc, wid);
+        g_force_id = 0;
+        logf_("%s %llu (event entity %llu): %s", forced ? "wfire" : "wbullet", id, wid, r == 1 ? "shootbullet handled" : r == 2 ? "event not handled" : r < 0 ? "weapon is not a bullet weapon" : "no weapon in hand");
         goto done;
     }
     if (op == 0) {
