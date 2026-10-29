@@ -45,6 +45,9 @@ param(
     # checked (the buddy faces where it walks)
     [switch]$AiBody,
     [string]$Buddy = 'buddies.Buddies.Frank_Bilders_Unarmed',
+    # with -AiBody: after the walk, remove B's buddy (what a death or checkpoint reload does to it) and require
+    # the probe to spawn a new one that stands near A
+    [switch]$AiRespawn,
     [double]$AiMeanLimit = 4,
     [double]$AiMaxLimit = 8,
     # the engine's ai_IgnorePlayer and cheat_GodMode in both copies, for saves next to enemies
@@ -240,16 +243,11 @@ try {
         foreach ($k in $copies.Keys) { Say "info: $k test settings: $(Lua $k "tostring(dostring('ai_IgnorePlayer = 1 cheat_GodMode = 1')) .. ' ignore=' .. tostring(ai_IgnorePlayer) .. ' god=' .. tostring(cheat_GodMode)")" }
     }
 
-    # ---- AI body: B spawns a buddy 3 m east of its player and lets it follow A's position (before the link,
-    # so the puppet avatar is never spawned) ----
+    # ---- AI body: B's probe spawns an invincible buddy at A's position once it arrives and lets it follow
+    # (set before the link, so the puppet avatar is never spawned) ----
     if ($AiBody) {
-        Native B "pos $pid0"
-        $p = (LogLines $copies.B | Select-String "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)" | Select-Object -Last 1).Matches[0]
-        $avB = Lua B ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "tostring(SpawnEntityFromArchetype('{0}', {1}, {2}, {3}, 0, 0, 0))",
-                $Buddy, [double]$p.Groups[1].Value + 3, [double]$p.Groups[2].Value, [double]$p.Groups[3].Value + 0.3))
-        Check 'buddy spawned B' ($avB -match '^\d+$' -and $avB -ne '18446744073709551615') "$Buddy -> $avB"
-        Native B "aistall 1000 1.5`r`nailead 0.7`r`naifollow $avB remote"
-        WaitFor 'ai follower (B)' 10 { LogLines $copies.B | Select-String "ai: following remote with pawn $avB" } | Out-Null
+        Native B "aistall 1000 1.5`r`nailead 0.7`r`naibody $Buddy remote"
+        WaitFor 'ai body set (B)' 10 { LogLines $copies.B | Select-String "ai: body $([regex]::Escape($Buddy)) follows remote" } | Out-Null
     }
 
     # ---- link ----
@@ -294,6 +292,9 @@ try {
         Check "link $k" ($rate -ge 10) ("{0:N1} packets/s received" -f $rate)
     }
     if ($AiBody) {
+        $sp = WaitFor 'buddy spawned (B)' 15 { LogLines $copies.B | Select-String 'ai: body spawned (\d+) .* invincible (\S+),' | Select-Object -Last 1 }
+        $avB = $sp.Matches[0].Groups[1].Value
+        Check 'buddy spawned B' ($sp.Matches[0].Groups[2].Value -eq 'ok') ($sp.Line -replace '^\S+ \S+ ', '')
         $n = @(LogLines $copies.B | Select-String 'avatar spawned').Count
         Check 'no puppet avatar B' ($n -eq 0) "$n puppet spawn(s) in B"
     }
@@ -378,6 +379,44 @@ try {
     }
     else { Check 'avatar follows A' ($maxErr -le 2.5 -and $meanErr -le 1.5) ("distance to A: mean {0:N2} m, max {1:N2} m (limits 1.5 / 2.5)" -f $meanErr, $maxErr) }
     Check 'B player stays put' ($drift -le 0.5) ("max drift {0:N2} m over {1} samples (limit 0.5)" -f $drift, $own.Count)
+
+    if ($AiBody -and $AiRespawn) {
+        $old = $avB
+        Lua B "tostring(RemoveEntity('$old'))" | Out-Null
+        $t0 = Get-Date
+        $sp = WaitFor 'buddy respawned (B)' 15 { LogLines $copies.B | Select-String 'ai: body spawned (\d+) .*lost, respawn.* invincible (\S+),' | Where-Object { $_.Matches[0].Groups[1].Value -ne $old } | Select-Object -Last 1 }
+        $avB = $sp.Matches[0].Groups[1].Value
+        Check 'buddy respawned B' ($sp.Matches[0].Groups[2].Value -eq 'ok') ("{0:N1} s after removal: {1}" -f ((Get-Date) - $t0).TotalSeconds, ($sp.Line -replace '^\S+ \S+ ', ''))
+        Start-Sleep 5
+        Native B "pos $avB"
+        $pb = (LogLines $copies.B | Select-String "pos ${avB}: x=(\S+) y=(\S+)" | Select-Object -Last 1).Matches[0]
+        $ra = (LogLines $copies.B | Select-String 'net: .* remote=\((\S+) (\S+) (\S+)\)' | Select-Object -Last 1).Matches[0]
+        $dr = Dist2D @([double]$pb.Groups[1].Value, [double]$pb.Groups[2].Value) @([double]$ra.Groups[1].Value, [double]$ra.Groups[2].Value)
+        Check 'respawned buddy near A' ($dr -le 5) ("{0:N2} m from A's position 5 s after the respawn (limit 5)" -f $dr)
+
+        # a real death: B's player is killed (god mode off), Enter on the death screen reloads the last save,
+        # which removes the buddy and the marker; the probe must spawn them again in the reloaded world
+        $before = @(LogLines $copies.B | Select-String 'ai: body spawned').Count
+        Lua B "tostring(dostring('cheat_GodMode = 0 Game:SetHealth(0)'))" | Out-Null
+        $t0 = Get-Date; $n = 0
+        while (((Get-Date) - $t0).TotalSeconds -lt 120 -and @(LogLines $copies.B | Select-String 'ai: body spawned').Count -le $before) {
+            Guard; Start-Sleep 4
+            if (((Get-Date) - $t0).TotalSeconds -gt 6) { Key B 0x0D; $n++ }
+        }
+        $sp = LogLines $copies.B | Select-String 'ai: body spawned (\d+) .* invincible (\S+),' | Select-Object -Last 1
+        $ok = @(LogLines $copies.B | Select-String 'ai: body spawned').Count -gt $before
+        Check 'buddy back after death and reload B' $ok ("{0:N0} s, {1} Enter presses: {2}" -f ((Get-Date) - $t0).TotalSeconds, $n, $(if ($ok) { $sp.Line -replace '^\S+ \S+ ', '' } else { 'no new spawn' }))
+        if ($TestSettings) { Lua B "tostring(dostring('cheat_GodMode = 1'))" | Out-Null }
+        if ($ok) {
+            $avB = $sp.Matches[0].Groups[1].Value
+            Start-Sleep 5
+            Native B "pos $avB"
+            $pb = (LogLines $copies.B | Select-String "pos ${avB}: x=(\S+) y=(\S+)" | Select-Object -Last 1).Matches[0]
+            $ra = (LogLines $copies.B | Select-String 'net: .* remote=\((\S+) (\S+) (\S+)\)' | Select-Object -Last 1).Matches[0]
+            $dr = if ($pb -and $ra) { Dist2D @([double]$pb.Groups[1].Value, [double]$pb.Groups[2].Value) @([double]$ra.Groups[1].Value, [double]$ra.Groups[2].Value) } else { 999 }
+            Check 'buddy near A after reload' ($dr -le 5) ("{0:N2} m from A's position 5 s after the respawn (limit 5)" -f $dr)
+        }
+    }
 
     # ---- heading: turn A's player with the mouse, compare A's direction with B's avatar ----
     $diffs = @(); $angles = @()

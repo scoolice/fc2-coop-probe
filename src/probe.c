@@ -506,25 +506,32 @@ static void native_cmd(const char *ln)
         obj = *(void **)((BYTE *)holder + 0xC);
         logf_("ent %llu: holder=%p obj=%p refs=%d", id, holder, obj, *(int *)((BYTE *)holder + 8));
         if (obj && !IsBadReadPtr(obj, n)) { logf_("vtable=%p", *(void **)obj); hexdump_((const BYTE *)obj, n); }
+        (*(int *)((BYTE *)holder + 8))--;  /* each lookup takes a reference */
     } else if (sscanf(ln, "pos %llu", &id) == 1) {
         void **pm = (void **)(g_base + RVA_ENTMGR_PTR);
         void *holder = NULL;
         BYTE *obj;
         if (IsBadReadPtr(pm, 4) || !*pm) { logf_("pos: entity manager null"); return; }
         ((getent_t)(g_base + RVA_GETENTITY))(*pm, &holder, (unsigned)id, (unsigned)(id >> 32));
-        if (!holder || IsBadReadPtr(holder, 16) || !*(void **)((BYTE *)holder + 0xC)) { logf_("pos %llu: no entity", id); return; }
+        if (!holder || IsBadReadPtr(holder, 16)) { logf_("pos %llu: no entity", id); return; }
         obj = *(BYTE **)((BYTE *)holder + 0xC);
-        logf_("pos %llu: x=%.3f y=%.3f z=%.3f dir=(%.3f,%.3f)", id, *(float *)(obj + 0x60), *(float *)(obj + 0x64), *(float *)(obj + 0x68), *(float *)(obj + 0x30), *(float *)(obj + 0x34));
+        if (!obj) logf_("pos %llu: no entity", id);
+        else logf_("pos %llu: x=%.3f y=%.3f z=%.3f dir=(%.3f,%.3f)", id, *(float *)(obj + 0x60), *(float *)(obj + 0x64), *(float *)(obj + 0x68), *(float *)(obj + 0x30), *(float *)(obj + 0x34));
+        (*(int *)((BYTE *)holder + 8))--;
     } else if (sscanf(ln, "setpos %llu %f %f %f", &id, &fx, &fy, &fz) == 4) {
         void **pm = (void **)(g_base + RVA_ENTMGR_PTR);
         void *holder = NULL;
         BYTE *obj;
         if (IsBadReadPtr(pm, 4) || !*pm) { logf_("setpos: entity manager null"); return; }
         ((getent_t)(g_base + RVA_GETENTITY))(*pm, &holder, (unsigned)id, (unsigned)(id >> 32));
-        if (!holder || IsBadReadPtr(holder, 16) || !*(void **)((BYTE *)holder + 0xC)) { logf_("setpos %llu: no entity", id); return; }
+        if (!holder || IsBadReadPtr(holder, 16)) { logf_("setpos %llu: no entity", id); return; }
         obj = *(BYTE **)((BYTE *)holder + 0xC);
-        *(float *)(obj + 0x60) = fx; *(float *)(obj + 0x64) = fy; *(float *)(obj + 0x68) = fz;
-        logf_("setpos %llu: wrote %.3f %.3f %.3f", id, fx, fy, fz);
+        if (!obj) logf_("setpos %llu: no entity", id);
+        else {
+            *(float *)(obj + 0x60) = fx; *(float *)(obj + 0x64) = fy; *(float *)(obj + 0x68) = fz;
+            logf_("setpos %llu: wrote %.3f %.3f %.3f", id, fx, fy, fz);
+        }
+        (*(int *)((BYTE *)holder + 8))--;
     } else if (sscanf(ln, "netstart %u %31s %u %llu", &g_net_lport, g_net_pip, &g_net_pport, &g_net_id) == 4) {
         g_net_cfg = 1;
         logf_("netstart requested: local %u peer %s:%u entity %llu", g_net_lport, g_net_pip, g_net_pport, g_net_id);
@@ -817,6 +824,12 @@ static float g_ai_lead, g_ai_vel[2], g_ai_prev[3];
 static DWORD g_ai_prevt;
 static DWORD g_ai_t0, g_ai_lastlog, g_ai_lastmove, g_ai_lastorder;
 static unsigned g_ai_orders, g_ai_tps;
+/* aibody: the pawn is our own, spawned from g_ai_arch and made invincible; when it or the marker is gone (a
+ * checkpoint reload or death removes both) or it ignores orders, both are spawned again at the target */
+static char g_ai_arch[96];
+static DWORD g_ai_lastspawn, g_ai_lastvalid;
+static int g_ai_lost;
+static unsigned g_ai_spawns, g_ai_stuck;
 
 static int ent_pos(unsigned long long id, float *out)
 {
@@ -838,6 +851,26 @@ static void ai_order(const char *why)
     logf_("ai: MoveTo sent (%s), speed %d", why, g_ai_speed);
 }
 
+static unsigned long long spawn_at(const char *arch, float x, float y, float z)
+{
+    char code[256], out[64];
+    unsigned long long id;
+    snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('%s', %.3f, %.3f, %.3f, 0, 0, 0))", arch, x, y, z);
+    lua_eval(code, out, sizeof out);
+    id = strtoull(out, NULL, 10);
+    if (id == 0xFFFFFFFFFFFFFFFFull) id = 0;
+    if (!id) logf_("ai: spawn of %s failed: %s", arch, out);
+    return id;
+}
+
+static void remove_entity(unsigned long long id)
+{
+    char code[96], out[32];
+    if (!id) return;
+    snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'ok'", id);
+    lua_eval(code, out, sizeof out);
+}
+
 static void ai_stop(void)
 {
     char code[192], out[32];
@@ -845,12 +878,30 @@ static void ai_stop(void)
         snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
         lua_eval(code, out, sizeof out);
     }
-    if (g_ai_marker) {
-        snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'ok'", g_ai_marker);
-        lua_eval(code, out, sizeof out);
-    }
-    logf_("ai: stopped (%u orders, %u teleports)", g_ai_orders, g_ai_tps);
-    g_ai_src = AI_OFF; g_ai_id = g_ai_marker = 0;
+    remove_entity(g_ai_marker);
+    if (g_ai_arch[0]) remove_entity(g_ai_id);
+    logf_("ai: stopped (%u orders, %u teleports, %u spawns)", g_ai_orders, g_ai_tps, g_ai_spawns);
+    g_ai_src = AI_OFF; g_ai_id = g_ai_marker = 0; g_ai_arch[0] = 0;
+}
+
+/* (re)spawns our pawn and its marker at the target, once the local player is in the world */
+static void ai_spawn(const float *t, const char *why)
+{
+    char code[192], out[32];
+    lua_eval("__out = tostring(IsEntityValid(GetLocalPlayerId()))", out, sizeof out);
+    if (strcmp(out, "1") != 0) return;
+    remove_entity(g_ai_marker); remove_entity(g_ai_id);
+    g_ai_id = g_ai_marker = 0;
+    g_ai_marker = spawn_at("weapons.Secondary.Makarov", t[0], t[1], t[2] + 0.5f);
+    if (g_ai_marker) g_ai_id = spawn_at(g_ai_arch, t[0] + 1.0f, t[1], t[2] + 0.3f);
+    if (!g_ai_id) return;
+    g_ai_lost = 0; g_ai_lastvalid = GetTickCount();
+    snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_SetInvincible') __out = 'ok'", g_ai_id);
+    lua_eval(code, out, sizeof out);
+    g_ai_spawns++; g_ai_stuck = 0;
+    memcpy(g_ai_last, t, 12); g_ai_lastmove = GetTickCount();
+    logf_("ai: body spawned %llu (%s, %s), marker %llu, invincible %s, spawns %u", g_ai_id, g_ai_arch, why, g_ai_marker, out, g_ai_spawns);
+    ai_order("spawn");
 }
 
 static int ai_target(DWORD now, float *t)
@@ -872,7 +923,22 @@ static void ai_tick(void)
     BYTE *m;
     if (g_ai_src == AI_OFF || g_nstates == 0 || GetCurrentThreadId() != g_states[0].thread) return;
     now = GetTickCount();
-    if (!ai_target(now, t) || !ent_pos(g_ai_id, p)) return;
+    if (!ai_target(now, t)) return;
+    /* a removed entity can still be found by id for a while (its object stays readable), so whether the pawn and
+     * the marker still exist is asked from the engine, once a second */
+    if (g_ai_arch[0] && g_ai_id && now - g_ai_lastvalid >= 1000) {
+        char code[160], out[16];
+        g_ai_lastvalid = now;
+        snprintf(code, sizeof code, "__out = tostring(IsEntityValid('%llu')) .. tostring(IsEntityValid('%llu'))", g_ai_id, g_ai_marker);
+        lua_eval(code, out, sizeof out);
+        if (strcmp(out, "11") != 0 && !g_ai_lost) { logf_("ai: body or marker gone (valid %s)", out); g_ai_lost = 1; }
+    }
+    if (g_ai_lost || !g_ai_id || !ent_pos(g_ai_id, p) || !entity_obj(g_ai_marker, &holder)) {
+        if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
+        if (g_ai_arch[0] && now - g_ai_lastspawn > 3000) { g_ai_lastspawn = now; ai_spawn(t, g_ai_spawns ? "lost, respawn" : "first"); }
+        return;
+    }
+    if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
     if (now - g_ai_prevt >= 100) {
         float dt = (now - g_ai_prevt) / 1000.0f;
         if (g_ai_prevt && dt < 1.0f) {
@@ -900,22 +966,36 @@ static void ai_tick(void)
         return;
     }
     moved = fabsf(p[0] - g_ai_last[0]) + fabsf(p[1] - g_ai_last[1]);
-    if (moved > 0.3f) { memcpy(g_ai_last, p, 12); g_ai_lastmove = now; }
-    else if (d > g_ai_stall_m && now - g_ai_lastmove > g_ai_stall_ms && now - g_ai_lastorder > g_ai_stall_ms) ai_order("stalled");
+    if (moved > 0.3f) { memcpy(g_ai_last, p, 12); g_ai_lastmove = now; g_ai_stuck = 0; }
+    else if (d > g_ai_stall_m && now - g_ai_lastmove > g_ai_stall_ms && now - g_ai_lastorder > g_ai_stall_ms) {
+        /* our own pawn that ignored five orders in a row while the target is away is replaced */
+        if (g_ai_arch[0] && ++g_ai_stuck >= 5 && d > 5.0f) { logf_("ai: body ignores orders, respawning"); g_ai_lastspawn = now; ai_spawn(t, "stuck"); return; }
+        ai_order("stalled");
+    }
     if (now - g_ai_lastlog >= 1000) {
         g_ai_lastlog = now;
         logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u", t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps);
     }
 }
 
-/* aifollow <pawn id> <remote|local|circle> [radius speed] | aispeed <n> | aitp <metres> | aistall <ms> <metres> |
- * ailead <seconds> | aistop */
+/* aibody <archetype> <remote|local> | aifollow <pawn id> <remote|local|circle> [radius speed] | aispeed <n> |
+ * aitp <metres> | aistall <ms> <metres> | ailead <seconds> | aistop */
 static int ai_cmd(const char *ln)
 {
     unsigned long long id;
-    char src[16], code[192], out[32];
+    char src[16], code[192], out[32], arch[96];
     float r = 0, v = 0, p[3];
     int n;
+    if (sscanf(ln, "aibody %95s %15s", arch, src) == 2) {
+        if (g_ai_src) ai_stop();
+        if (strcmp(src, "remote") && strcmp(src, "local")) { logf_("ai: aibody follows remote or local"); return 1; }
+        strcpy(g_ai_arch, arch);
+        g_ai_src = !strcmp(src, "remote") ? AI_REMOTE : AI_LOCAL;
+        g_ai_id = g_ai_marker = 0; g_ai_orders = g_ai_tps = g_ai_spawns = 0; g_ai_lastspawn = 0; g_ai_lost = 0;
+        g_ai_t0 = g_ai_lastlog = GetTickCount(); g_ai_vel[0] = g_ai_vel[1] = 0; g_ai_prevt = 0;
+        logf_("ai: body %s follows %s (spawned once there is a target)", arch, src);
+        return 1;
+    }
     if (sscanf(ln, "aispeed %d", &n) == 1) { g_ai_speed = n; logf_("ai: speed %d", n); if (g_ai_src) ai_order("speed"); return 1; }
     if (sscanf(ln, "aitp %f", &r) == 1) { g_ai_tp = r; logf_("ai: teleport distance %.1f", r); return 1; }
     if (sscanf(ln, "ailead %f", &r) == 1) { g_ai_lead = r; logf_("ai: marker leads by %.2f s", r); return 1; }

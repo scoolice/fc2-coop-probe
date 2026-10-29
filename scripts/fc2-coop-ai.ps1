@@ -40,20 +40,18 @@ if (-not $NoTestSettings) {
     foreach ($c in $copies) { Write-Output ("[coop] {0}: {1}" -f $c.title, (Lua $c.dir "ai_IgnorePlayer = 1 cheat_GodMode = 1 __out = 'ignore=' .. tostring(ai_IgnorePlayer) .. ' god=' .. tostring(cheat_GodMode)")) }
 }
 foreach ($c in $copies) {
-    # the buddy appears 3 m east of this copy's own player (both players start on the same spot)
-    $pos = (powershell -NoProfile -File (Join-Path $tools 'fc2-native.ps1') -Copy $c.dir -Text "pos $($c.player)" -Wait 300 | Select-String "pos $($c.player): x=(\S+) y=(\S+) z=(\S+)").Matches[0]
-    $inv = [Globalization.CultureInfo]::InvariantCulture
-    $b = Lua $c.dir ([string]::Format($inv, "__out = tostring(SpawnEntityFromArchetype('{0}', {1}, {2}, {3}, 0, 0, 0))",
-            $c.buddy, [double]$pos.Groups[1].Value + 3, [double]$pos.Groups[2].Value, [double]$pos.Groups[3].Value + 0.3))
-    if ($b -notmatch '^\d+$' -or $b -eq '18446744073709551615') { throw "copy $($c.title): buddy spawn failed: $b" }
-    $c.buddyId = $b
-    Native $c.dir "aistall 1000 1.5\nailead 0.7\naifollow $b remote"
-    Write-Output "[coop] $($c.title): buddy $b ($($c.buddy)) follows the other player"
+    # before netstart, so no puppet is spawned; the probe spawns the invincible buddy at the other player once
+    # their position arrives, and again whenever it is lost
+    Native $c.dir "aistall 1000 1.5\nailead 0.7\naibody $($c.buddy) remote"
+    Write-Output "[coop] $($c.title): $($c.buddy) will follow the other player"
 }
 foreach ($c in $copies) { Native $c.dir "netstart $($c.port) 127.0.0.1 $($c.peer) $($c.player)" }
-Start-Sleep 4
+Start-Sleep 6
 foreach ($c in $copies) {
-    $net = Get-Content (Join-Path $c.dir 'bin\coop_probe.log') | Select-String '\] net: tx=' | Select-Object -Last 1
+    $log = Get-Content (Join-Path $c.dir 'bin\coop_probe.log')
+    $net = $log | Select-String '\] net: tx=' | Select-Object -Last 1
+    $body = $log | Select-String 'ai: body spawned .*' | Select-Object -Last 1
     Write-Output "[coop] $($c.title): $($net.Line -replace '^\[[^\]]*\] ', '')"
+    Write-Output "[coop] $($c.title): $(if ($body) { $body.Matches[0].Value } else { 'no buddy spawned yet' })"
 }
 Write-Output '[coop] session up: play in window A; window B shows A''s player as its buddy (and A shows B''s)'

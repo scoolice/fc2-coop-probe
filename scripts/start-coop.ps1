@@ -130,16 +130,11 @@ try {
         $r = Lua "tostring(dostring('ai_IgnorePlayer = 1 cheat_GodMode = 1')) .. ' ignore=' .. tostring(ai_IgnorePlayer) .. ' god=' .. tostring(cheat_GodMode)"
         Say "test settings: $($r -replace '^.* ignore', 'ignore')"
     }
-    $buddyId = $null
     if ($AiBody) {
-        # before netstart, so the puppet avatar is never spawned; the buddy appears 3 m east of this player
-        Native "pos $id"
-        $p = (LogLines | Select-String "pos ${id}: x=(\S+) y=(\S+) z=(\S+)" | Select-Object -Last 1).Matches[0]
-        $buddyId = Lua ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "tostring(SpawnEntityFromArchetype('{0}', {1}, {2}, {3}, 0, 0, 0))",
-                $Buddy, [double]$p.Groups[1].Value + 3, [double]$p.Groups[2].Value, [double]$p.Groups[3].Value + 0.3))
-        if ($buddyId -notmatch '^\d+$' -or $buddyId -eq '18446744073709551615') { throw "buddy spawn failed: $buddyId" }
-        Native "aistall 1000 1.5`r`nailead 0.7`r`naifollow $buddyId remote"
-        Say "AI body: buddy $buddyId ($Buddy) will follow the other player"
+        # before netstart, so the puppet avatar is never spawned; the probe spawns the (invincible) buddy at the
+        # other player once their position arrives, and again whenever it is lost (death, checkpoint reload)
+        Native "aistall 1000 1.5`r`nailead 0.7`r`naibody $Buddy remote"
+        Say "AI body: $Buddy will follow the other player"
     }
 
     $relay = StartRelay
@@ -160,17 +155,24 @@ try {
     Native "netstart $gamePort 127.0.0.1 $relayPort $id"
     Say "probe connected to the relay (netstart $gamePort 127.0.0.1 $relayPort)"
 
-    $avatar = $buddyId; $last = Get-Date; $sample = Get-Date; $start = Get-Date
+    $avatar = $null; $last = Get-Date; $sample = Get-Date; $start = Get-Date
+    $spawnRe = if ($AiBody) { 'ai: body spawned (\d+)' } else { 'avatar spawned: (\d+)' }
     while (-not $game.HasExited -and (-not $Seconds -or ((Get-Date) - $start).TotalSeconds -lt $Seconds)) {
         Start-Sleep -Milliseconds 500; Guard
-        if (-not $avatar) { $a = LogLines | Select-String 'avatar spawned: (\d+)' | Select-Object -Last 1; if ($a) { $avatar = $a.Matches[0].Groups[1].Value; Say "avatar of the other player spawned: $avatar" } }
+        # the AI body is spawned again after a death or reload, so keep following the newest id
+        $a = LogLines | Select-String $spawnRe | Select-Object -Last 1
+        if ($a -and $a.Matches[0].Groups[1].Value -ne $avatar) { $avatar = $a.Matches[0].Groups[1].Value; Say "the other player's $(if ($AiBody) { 'buddy' } else { 'avatar' }) spawned: $avatar" }
         if ($Role -eq 'join' -and $avatar -and ((Get-Date) - $sample).TotalSeconds -ge 2) { $sample = Get-Date; Native "pos $avatar`r`npos $id" }
         if (((Get-Date) - $last).TotalSeconds -ge 5) {
             $last = Get-Date
             $net = LogLines | Select-String '\] net: ' | Select-Object -Last 1
             $st = Get-Content (Join-Path $runDir 'relay.log') -ErrorAction SilentlyContinue | Select-String 'stats ' | Select-Object -Last 1
             Say ("{0} | {1}" -f $(if ($net) { $net.Line -replace '^\S+ \S+ ', '' } else { 'no net line yet' }), $(if ($st) { $st.Line } else { 'no relay stats yet' }))
-            if ($AiBody) { $ai = LogLines | Select-String '\] ai: target .* dist (\S+) orders (\d+) tps (\d+)' | Select-Object -Last 1; if ($ai) { Say ("AI body: {0} m behind, {1} orders, {2} teleports" -f $ai.Matches[0].Groups[1].Value, $ai.Matches[0].Groups[2].Value, $ai.Matches[0].Groups[3].Value) } }
+            if ($AiBody) {
+                $ai = LogLines | Select-String '\] ai: target .* dist (\S+) orders (\d+) tps (\d+)' | Select-Object -Last 1
+                $sp = @(LogLines | Select-String 'ai: body spawned').Count
+                if ($ai) { Say ("AI body: {0} m behind, {1} orders, {2} teleports, {3} spawn(s)" -f $ai.Matches[0].Groups[1].Value, $ai.Matches[0].Groups[2].Value, $ai.Matches[0].Groups[3].Value, $sp) }
+            }
             if ($relay.HasExited) { Say 'relay exited'; break }
         }
     }

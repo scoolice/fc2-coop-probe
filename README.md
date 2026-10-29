@@ -83,6 +83,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `netstop` | Stop it and remove the avatar |
 | `bodies` | Log every body of the class above with its position (AI pawns do not use this class) |
 | `ents <id> <radius>` | Log every object of the same class as the entity's object within `radius` m, with its entity id (finds nearby pawns; `GetEntityName(id)` names them) |
+| `aibody <archetype> remote\|local` | Spawn an AI pawn of `archetype` (for example `buddies.Buddies.Frank_Bilders_Unarmed`) at the target once there is one, make it invincible and follow the peer or the local player; the pawn and its marker are spawned again whenever the engine reports either as gone (`IsEntityValid`, checked once a second: a death or checkpoint reload removes both) or the pawn ignores five orders in a row |
 | `aifollow <pawn> remote\|local\|circle [<r> <v>]` | Make an AI pawn follow the peer (`remote`), the local player (`local`, needs `findbody` first) or a test circle of radius `r` at `v` m/s (see [AI body](#ai-body-an-animated-peer)); with `remote` the puppet avatar is not spawned |
 | `aistall <ms> <m>` / `ailead <s>` / `aispeed <n>` / `aitp <m>` | Follower tuning: re-order a pawn that stood `ms` while more than `m` away (default 6000 / 3); lead the marker by `s` s of the target's velocity (default 0); MoveTo speed value (default 3); teleport distance (default 10) |
 | `aistop` | Stop the follower and remove its marker |
@@ -171,12 +172,15 @@ is a stand-in that relays over plain UDP, used by the test to run the whole chai
 - `scripts/get-steam-api.ps1`: downloads Steamworks.NET Standalone 2025.164.1 and checks the zip and
   `steam_api64.dll` hashes.
 - `scripts/start-coop.ps1 -Role host|join -TestDir <copy> -SteamDll <steam_api64.dll> [-Python <python.exe>]
-  [-Invite "<friend's Steam name>"] [-Join friend|wait]`:
+  [-Invite "<friend's Steam name>"] [-Join friend|wait] [-AiBody [-Buddy <archetype>]] [-TestSettings]`:
   checks the copy's patches and that its profile folder has a save (so Enter can never start a New Story),
   starts the copy (window title `A` / `B`, kept for the run), presses Enter until the save opens, waits for the
   player id, starts the relay (host: lobby; join: finds the friend's lobby, retrying for up to 10 min), runs
   `netstart`, prints the link state every 5 s, and on the join side samples the avatar's and the own player's
   position every 2 s. Kill switch on the real profile path; logs in `<copy>\coop-runs\<time>-<role>\`.
+  With `-AiBody` the probe gets `aibody <-Buddy> remote` before `netstart` (the other player appears as an
+  invincible buddy, spawned again after a death or reload; the 5 s status line adds its distance, orders,
+  teleports and spawns); `-TestSettings` switches on `ai_IgnorePlayer` and `cheat_GodMode`.
 
 Tested:
 - the whole chain through two udp relays with both copies on one PC (the two-copy test with `-Relay`);
@@ -219,6 +223,10 @@ makes it walk or run to an entity with normal animation. The follower uses that:
   gets a new order; a pawn more than `aitp` m behind is moved onto the marker with
   `TeleportEntity(pawn, marker)` and ordered again. Spawned buddies start within about 1 s of an
   order; level soldiers need 2-4 s, and re-ordering them sooner keeps them standing.
+- `aibody` spawns the buddy itself, sends it `CFCXCountersComponent_SetInvincible` (the event the puppet
+  uses) and spawns buddy and marker again when they are gone. A removed entity can still be found by id
+  for a while with a readable object, so liveness is asked from the engine (`IsEntityValid`), not read
+  from memory.
 - Registering the `MoveToStarted/Finished/Failed` callbacks (`CScriptCallbackSystem`) from a plain
   Lua table crashed the game (null read in the Lua VM); the follower does not use them.
 
@@ -264,9 +272,9 @@ are titled `A` and `B` so they are easy to tell apart.
 
 `-MoveBAside <m>` teleports B's own player `m` metres off A's circle before the walk (both players
 start on the same spot and the circle runs through it, so the avatar can bump B's player and fail
-`B player stays put`). `-AiBody` shows A in copy B as an AI body instead of the puppet: B spawns
-`-Buddy` (default Frank) and runs `aifollow <buddy> remote` before the link; it checks
-`buddy spawned B`, `no puppet avatar B`, `buddy follows A` (mean and max distance within
+`B player stays put`). `-AiBody` shows A in copy B as an AI body instead of the puppet: B runs
+`aibody <-Buddy> remote` (default Frank) before the link; it checks `buddy spawned B` (invincible),
+`no puppet avatar B`, `buddy follows A` (mean and max distance within
 `-AiMeanLimit` 4 / `-AiMaxLimit` 8 m) and `buddy not teleported`, and skips the heading checks.
 `-TestSettings` switches on `ai_IgnorePlayer` and `cheat_GodMode` in both copies, for saves next to
 enemies. Last AI-body run (2026-10-28, `-AiBody -TestSettings -MoveBAside 5 -WalkRadius 6 -WalkSpeed 1.5
@@ -294,6 +302,20 @@ The buddy needs about a second to start after each order, so it falls furthest b
 start of each leg and when the peer runs. The walking run again with `-Relay` (both probes through
 two `fc2_relay.py` processes, udp transport): 23 checks, 1 failed (`buddy follows A`: mean 2.98 m,
 max 9.19 m, 0 teleports); the relays carried 759 / 703 packets each way with 0 dropped.
+
+`-AiRespawn` (with `-AiBody`) then removes B's buddy and requires a new one near A, and kills B's
+player (`cheat_GodMode = 0`, `Game:SetHealth(0)`), presses Enter on the death screen ("Load last
+Save" is the first choice) and requires a new buddy near A in the reloaded world:
+
+```
+-AiBody -AiRespawn -TestSettings -MoveBAside 5 -WalkLegs "1.5 2 -10 0 0 8 10 0 0 -8":  25 checks, 0 failed -> PASS
+  buddy follows A: mean 2.66 m, max 7.39 m; buddy spawned B: invincible ok
+  buddy respawned B: within the 1 s liveness check after removal; 0.01 m from A 5 s later
+  buddy back after death and reload B: 13 s, 2 Enter presses; 1.01 m from A 5 s later
+```
+
+The follow distance is close to its limit on this path (max 7.39 to 9.19 m over four runs), so that
+check can still fail.
 
 It presses Enter and moves the mouse in the game windows, so leave keyboard and mouse alone for
 the ~2.5 minutes it runs. Exit code 0 = pass, 1 = a check failed, 2 = setup problem; `run.txt`,
