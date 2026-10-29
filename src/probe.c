@@ -390,6 +390,7 @@ static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
 }
 
 static BYTE *entity_obj(unsigned long long id, void **holder_out);
+static int ai_cmd(const char *ln);
 /* exclude: a body to skip (the local player's when binding the avatar: both stand on the same spot
  * after loading the same save, so the nearest body would otherwise be the player's own) */
 static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, const BYTE *exclude)
@@ -438,6 +439,51 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, con
     logf_("findbody done: %d match(es) near entity %.3f %.3f %.3f, nearest dist %.3f", found, ex, ey, ez, *body_out ? best : -1.0f);
     return *body_out != NULL;
 }
+/* calls fn(address, chunk copy at that address, bytes readable from it) for every dword equal to vt in
+ * committed read-write memory; reads in chunks through safe_read, like find_body */
+static void scan_vtable(unsigned vt, void (*fn)(BYTE *at, const BYTE *copy, size_t avail, void *ctx), void *ctx)
+{
+    static BYTE chunk[0x10000 + 0x400];
+    MEMORY_BASIC_INFORMATION mbi;
+    BYTE *p = NULL;
+    while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (mbi.Protect & PAGE_READWRITE) && mbi.RegionSize < 0x20000000) {
+            BYTE *base = (BYTE *)mbi.BaseAddress, *rend = base + mbi.RegionSize, *c;
+            for (c = base; c < rend; c += 0x10000) {
+                size_t n = (size_t)(rend - c), k;
+                if (n > sizeof chunk) n = sizeof chunk;
+                if (!safe_read(c, chunk, n)) continue;
+                for (k = 0; k + 4 <= n && k < 0x10000; k += 4)
+                    if (*(unsigned *)(chunk + k) == vt) fn(c + k, chunk + k, n - k, ctx);
+            }
+        }
+        p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+    }
+}
+
+static void bodies_cb(BYTE *at, const BYTE *copy, size_t avail, void *ctx)
+{
+    float f[3];
+    int *n = ctx;
+    if (avail < 0x1C) return;
+    if (!safe_read(*(BYTE **)(copy + 0x18) + 0x30, f, sizeof f)) return;
+    if (++*n <= 200) logf_("bodies: %p pos %.3f %.3f %.3f%s", at, f[0], f[1], f[2], at == g_body ? " (cached local)" : "");
+}
+
+struct ents_ctx { float c[3], r; int id_off, n; };
+static void ents_cb(BYTE *at, const BYTE *copy, size_t avail, void *ctx)
+{
+    struct ents_ctx *e = ctx;
+    float x, y, z, d;
+    if (avail < 0x6C || (e->id_off >= 0 && avail < (size_t)e->id_off + 8)) return;
+    x = *(const float *)(copy + 0x60); y = *(const float *)(copy + 0x64); z = *(const float *)(copy + 0x68);
+    d = sqrtf((x - e->c[0]) * (x - e->c[0]) + (y - e->c[1]) * (y - e->c[1]) + (z - e->c[2]) * (z - e->c[2]));
+    if (!(d <= e->r)) return;
+    if (++e->n > 200) return;
+    if (e->id_off >= 0) logf_("ents: %p id %llu pos %.3f %.3f %.3f dist %.2f", at, *(const unsigned long long *)(copy + e->id_off), x, y, z, d);
+    else logf_("ents: %p pos %.3f %.3f %.3f dist %.2f", at, x, y, z, d);
+}
+
 static void native_cmd(const char *ln)
 {
     unsigned long long id;
@@ -497,6 +543,26 @@ static void native_cmd(const char *ln)
         logf_("avvel: wrote %.2f %.2f %.2f at avatar body+0x%lx", fx, fy, fz, a);
     } else if (sscanf(ln, "findbody %llu", &id) == 1) {
         find_body(id, &g_body, &g_bodymat, NULL);
+    } else if (strncmp(ln, "bodies", 6) == 0) {
+        int nb = 0;
+        scan_vtable((unsigned)(g_base + RVA_BODY_VTABLE), bodies_cb, &nb);
+        logf_("bodies done: %d of class RVA 0x%x (first 200 logged)", nb, RVA_BODY_VTABLE);
+    } else if (sscanf(ln, "ents %llu %f", &id, &fx) == 2) {
+        /* objects with the same vtable as entity id's object, within fx metres of it; the offset where that
+         * object stores its own id is found first, so every match is logged with its entity id */
+        void *holder = NULL;
+        BYTE *obj = entity_obj(id, &holder);
+        struct ents_ctx e;
+        int k;
+        if (!obj) { logf_("ents %llu: no entity", id); return; }
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        e.c[0] = *(float *)(obj + 0x60); e.c[1] = *(float *)(obj + 0x64); e.c[2] = *(float *)(obj + 0x68);
+        e.r = fx; e.n = 0; e.id_off = -1;
+        for (k = 4; k + 8 <= 0x400; k += 4)
+            if (!IsBadReadPtr(obj + k, 8) && *(unsigned long long *)(obj + k) == id) { e.id_off = k; break; }
+        logf_("ents %llu: vtable %p, own id at +0x%x", id, *(void **)obj, e.id_off);
+        scan_vtable(*(unsigned *)obj, ents_cb, &e);
+        logf_("ents done: %d within %.1f m (first 200 logged)", e.n, fx);
     } else if (strncmp(ln, "posb", 4) == 0) {
         if (!g_bodymat || IsBadReadPtr(g_bodymat, 0x40) || *(unsigned *)g_body != (unsigned)(g_base + RVA_BODY_VTABLE)) logf_("posb: no valid cached body");
         else logf_("posb: %.3f %.3f %.3f", *(float *)(g_bodymat + 0x30), *(float *)(g_bodymat + 0x34), *(float *)(g_bodymat + 0x38));
@@ -571,7 +637,7 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "poke %lx %lx", &a, &pv) == 2) {
         if (IsBadWritePtr((void *)a, 4)) logf_("poke %lx: not writable", a);
         else { *(unsigned long *)a = pv; logf_("poke %lx = %08lx", a, pv); }
-    } else logf_("native: unknown command: %s", ln);
+    } else if (!ai_cmd(ln)) logf_("native: unknown command: %s", ln);
 }
 
 static void run_native(void)
@@ -711,6 +777,149 @@ static void av_tick(DWORD now)
     }
 }
 
+/* ---- AI body: an AI pawn walks after a target with its own locomotion (and animation) ----
+ * The engine's Domino MoveTo command walks a pawn to an entity; it keeps following that entity when it
+ * moves. The target entity is a pistol spawned on the ground (no faction, nothing for the AI to react
+ * to) whose position is written every tick; a pawn too far behind is teleported onto it. */
+enum { AI_OFF, AI_REMOTE, AI_LOCAL, AI_CIRCLE };
+static int g_ai_src, g_ai_speed = 3;
+static unsigned long long g_ai_id, g_ai_marker;
+static float g_ai_tp = 10.0f, g_ai_c[3], g_ai_r, g_ai_v, g_ai_last[3];
+/* MoveTo ends on arrival, so a stopped pawn is re-ordered once it has stood for g_ai_stall_ms while the target
+ * is more than g_ai_stall_m away. Soldiers need 2-4 s to start (re-ordering sooner keeps them standing);
+ * spawned buddies start within 1 s */
+static DWORD g_ai_stall_ms = 6000;
+static float g_ai_stall_m = 3.0f;
+/* the marker leads the target by g_ai_lead seconds of its (smoothed) velocity, so a pawn following a moving
+ * target keeps walking instead of arriving, stopping and waiting for the next order */
+static float g_ai_lead, g_ai_vel[2], g_ai_prev[3];
+static DWORD g_ai_prevt;
+static DWORD g_ai_t0, g_ai_lastlog, g_ai_lastmove, g_ai_lastorder;
+static unsigned g_ai_orders, g_ai_tps;
+
+static int ent_pos(unsigned long long id, float *out)
+{
+    void *holder = NULL;
+    BYTE *obj = entity_obj(id, &holder);
+    int ok = obj && !IsBadReadPtr(obj + 0x60, 12);
+    if (ok) memcpy(out, obj + 0x60, 12);
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    return ok;
+}
+
+static void ai_order(const char *why)
+{
+    char code[192], out[32];
+    snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveTo', '%llu', %d, 0) __out = 'ok'",
+             g_ai_id, g_ai_marker, g_ai_speed);
+    lua_eval(code, out, sizeof out);
+    g_ai_orders++; g_ai_lastorder = GetTickCount();
+    logf_("ai: MoveTo sent (%s), speed %d", why, g_ai_speed);
+}
+
+static void ai_stop(void)
+{
+    char code[192], out[32];
+    if (g_ai_id) {
+        snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
+        lua_eval(code, out, sizeof out);
+    }
+    if (g_ai_marker) {
+        snprintf(code, sizeof code, "RemoveEntity('%llu') __out = 'ok'", g_ai_marker);
+        lua_eval(code, out, sizeof out);
+    }
+    logf_("ai: stopped (%u orders, %u teleports)", g_ai_orders, g_ai_tps);
+    g_ai_src = AI_OFF; g_ai_id = g_ai_marker = 0;
+}
+
+static int ai_target(DWORD now, float *t)
+{
+    if (g_ai_src == AI_REMOTE) { if (g_net_rx == 0) return 0; memcpy(t, g_remote.pos, 12); return 1; }
+    if (g_ai_src == AI_LOCAL) return g_bodymat && !IsBadReadPtr(g_bodymat, 0x40) ? (memcpy(t, g_bodymat + 0x30, 12), 1) : 0;
+    {
+        float ang = g_ai_v * ((now - g_ai_t0) / 1000.0f) / g_ai_r;
+        t[0] = g_ai_c[0] + g_ai_r * (cosf(ang) - 1.0f); t[1] = g_ai_c[1] + g_ai_r * sinf(ang); t[2] = g_ai_c[2];
+        return 1;
+    }
+}
+
+static void ai_tick(void)
+{
+    DWORD now;
+    float t[3], p[3], d, moved;
+    void *holder = NULL;
+    BYTE *m;
+    if (g_ai_src == AI_OFF || g_nstates == 0 || GetCurrentThreadId() != g_states[0].thread) return;
+    now = GetTickCount();
+    if (!ai_target(now, t) || !ent_pos(g_ai_id, p)) return;
+    if (now - g_ai_prevt >= 100) {
+        float dt = (now - g_ai_prevt) / 1000.0f;
+        if (g_ai_prevt && dt < 1.0f) {
+            g_ai_vel[0] += ((t[0] - g_ai_prev[0]) / dt - g_ai_vel[0]) * 0.3f;
+            g_ai_vel[1] += ((t[1] - g_ai_prev[1]) / dt - g_ai_vel[1]) * 0.3f;
+        }
+        memcpy(g_ai_prev, t, 12); g_ai_prevt = now;
+    }
+    m = entity_obj(g_ai_marker, &holder);
+    if (m && !IsBadWritePtr(m + 0x60, 12)) {
+        float *mp = (float *)(m + 0x60);
+        mp[0] = t[0] + g_ai_vel[0] * g_ai_lead; mp[1] = t[1] + g_ai_vel[1] * g_ai_lead; mp[2] = t[2];
+    }
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    d = sqrtf((t[0] - p[0]) * (t[0] - p[0]) + (t[1] - p[1]) * (t[1] - p[1]));
+    /* the pawn's position only changes on the next frame after a teleport, hence the cooldown */
+    if (d > g_ai_tp && now - g_ai_lastorder > 1000) {
+        char code[192], out[32];
+        snprintf(code, sizeof code, "TeleportEntity('%llu', '%llu') __out = 'ok'", g_ai_id, g_ai_marker);
+        lua_eval(code, out, sizeof out);
+        g_ai_tps++;
+        logf_("ai: %.1f m behind, teleported", d);
+        ai_order("after teleport");
+        memcpy(g_ai_last, t, 12); g_ai_lastmove = now;
+        return;
+    }
+    moved = fabsf(p[0] - g_ai_last[0]) + fabsf(p[1] - g_ai_last[1]);
+    if (moved > 0.3f) { memcpy(g_ai_last, p, 12); g_ai_lastmove = now; }
+    else if (d > g_ai_stall_m && now - g_ai_lastmove > g_ai_stall_ms && now - g_ai_lastorder > g_ai_stall_ms) ai_order("stalled");
+    if (now - g_ai_lastlog >= 1000) {
+        g_ai_lastlog = now;
+        logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u", t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps);
+    }
+}
+
+/* aifollow <pawn id> <remote|local|circle> [radius speed] | aispeed <n> | aitp <metres> | aistall <ms> <metres> |
+ * ailead <seconds> | aistop */
+static int ai_cmd(const char *ln)
+{
+    unsigned long long id;
+    char src[16], code[192], out[32];
+    float r = 0, v = 0, p[3];
+    int n;
+    if (sscanf(ln, "aispeed %d", &n) == 1) { g_ai_speed = n; logf_("ai: speed %d", n); if (g_ai_src) ai_order("speed"); return 1; }
+    if (sscanf(ln, "aitp %f", &r) == 1) { g_ai_tp = r; logf_("ai: teleport distance %.1f", r); return 1; }
+    if (sscanf(ln, "ailead %f", &r) == 1) { g_ai_lead = r; logf_("ai: marker leads by %.2f s", r); return 1; }
+    if (sscanf(ln, "aistall %d %f", &n, &r) == 2) { g_ai_stall_ms = (DWORD)n; g_ai_stall_m = r; logf_("ai: re-order after %d ms standing, beyond %.1f m", n, r); return 1; }
+    if (strncmp(ln, "aistop", 6) == 0) { ai_stop(); return 1; }
+    if (sscanf(ln, "aifollow %llu %15s %f %f", &id, src, &r, &v) < 2) return 0;
+    if (g_ai_src) ai_stop();
+    if (!ent_pos(id, p)) { logf_("ai: no entity %llu", id); return 1; }
+    snprintf(code, sizeof code, "__out = tostring(SpawnEntityFromArchetype('weapons.Secondary.Makarov', %.3f, %.3f, %.3f, 0, 0, 0))", p[0], p[1], p[2] + 0.5f);
+    lua_eval(code, out, sizeof out);
+    g_ai_marker = strtoull(out, NULL, 10);
+    if (g_ai_marker == 0 || g_ai_marker == 0xFFFFFFFFFFFFFFFFull) { logf_("ai: marker spawn failed: %s", out); g_ai_marker = 0; return 1; }
+    g_ai_id = id; g_ai_orders = g_ai_tps = 0;
+    g_ai_src = !strcmp(src, "remote") ? AI_REMOTE : !strcmp(src, "local") ? AI_LOCAL : AI_CIRCLE;
+    if (g_ai_src == AI_CIRCLE) {
+        if (r <= 0 || v <= 0) { logf_("ai: circle needs radius and speed"); ai_stop(); return 1; }
+        memcpy(g_ai_c, p, 12); g_ai_r = r; g_ai_v = v;
+    }
+    g_ai_t0 = g_ai_lastlog = g_ai_lastmove = GetTickCount(); memcpy(g_ai_last, p, 12);
+    g_ai_vel[0] = g_ai_vel[1] = 0; g_ai_prevt = 0;
+    logf_("ai: following %s with pawn %llu, marker %llu", src, id, g_ai_marker);
+    ai_order("start");
+    return 1;
+}
+
 static void net_tick(void)
 {
     DWORD now;
@@ -770,7 +979,8 @@ static void net_tick(void)
         if (r != (int)sizeof p || p.magic != NET_MAGIC || from.sin_addr.s_addr != g_peer.sin_addr.s_addr) { g_net_drop++; continue; }
         g_remote = p; g_net_rx++; g_net_lastrx = now;
     }
-    av_tick(now);
+    /* with an AI body following the peer, the puppet avatar is not spawned */
+    if (g_ai_src != AI_REMOTE) av_tick(now);
     /* send at 20 Hz */
     if (g_bodymat && now - g_net_lastsend >= 50) {
         NetPkt p;
@@ -807,8 +1017,8 @@ static void pump_main(void)
     run_cmd(g_states[0].L);
     g_busy = 0;
 }
-static BOOL WINAPI h_PeekMessageA(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); pump_main(); return o_PeekMessageA(m, h, a, b, c); }
-static BOOL WINAPI h_PeekMessageW(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); pump_main(); return o_PeekMessageW(m, h, a, b, c); }
+static BOOL WINAPI h_PeekMessageA(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); ai_tick(); pump_main(); return o_PeekMessageA(m, h, a, b, c); }
+static BOOL WINAPI h_PeekMessageW(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); ai_tick(); pump_main(); return o_PeekMessageW(m, h, a, b, c); }
 
 static int __cdecl h_gettop(void *L)
 {

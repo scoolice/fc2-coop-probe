@@ -33,6 +33,19 @@ param(
     [double]$WalkRadius = 3,
     [double]$WalkSeconds = 20,
     [double]$WalkSpeed = 2,
+    # metres to teleport B's own player in +x before the walk. Both copies start on the same spot and
+    # A's circle (from its start towards -x) runs through it, so the avatar can bump B's player.
+    # 0 keeps B on the circle.
+    [double]$MoveBAside = 0,
+    # B shows A's player as a spawned buddy that walks after A's position (probe `aifollow <buddy> remote`)
+    # instead of the puppet avatar. A chasing AI trails behind, so it gets its own limits; heading is not
+    # checked (the buddy faces where it walks)
+    [switch]$AiBody,
+    [string]$Buddy = 'buddies.Buddies.Frank_Bilders_Unarmed',
+    [double]$AiMeanLimit = 4,
+    [double]$AiMaxLimit = 8,
+    # the engine's ai_IgnorePlayer and cheat_GodMode in both copies, for saves next to enemies
+    [switch]$TestSettings,
     [int]$LoadTimeout = 240
 )
 
@@ -218,6 +231,23 @@ try {
     }
     Check 'same player id' ($ids.A -eq $ids.B) "A=$($ids.A) B=$($ids.B)"
     $pid0 = $ids.A
+    if ($TestSettings) {
+        # assignments go through the engine's setglobal hook into its console variables
+        # (Lua takes an expression, so the assignments run through dostring)
+        foreach ($k in $copies.Keys) { Say "info: $k test settings: $(Lua $k "tostring(dostring('ai_IgnorePlayer = 1 cheat_GodMode = 1')) .. ' ignore=' .. tostring(ai_IgnorePlayer) .. ' god=' .. tostring(cheat_GodMode)")" }
+    }
+
+    # ---- AI body: B spawns a buddy 3 m east of its player and lets it follow A's position (before the link,
+    # so the puppet avatar is never spawned) ----
+    if ($AiBody) {
+        Native B "pos $pid0"
+        $p = (LogLines $copies.B | Select-String "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)" | Select-Object -Last 1).Matches[0]
+        $avB = Lua B ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "tostring(SpawnEntityFromArchetype('{0}', {1}, {2}, {3}, 0, 0, 0))",
+                $Buddy, [double]$p.Groups[1].Value + 3, [double]$p.Groups[2].Value, [double]$p.Groups[3].Value + 0.3))
+        Check 'buddy spawned B' ($avB -match '^\d+$' -and $avB -ne '18446744073709551615') "$Buddy -> $avB"
+        Native B "aistall 1000 1.5`r`nailead 0.7`r`naifollow $avB remote"
+        WaitFor 'ai follower (B)' 10 { LogLines $copies.B | Select-String "ai: following remote with pawn $avB" } | Out-Null
+    }
 
     # ---- link ----
     if ($Relay) {
@@ -241,10 +271,11 @@ try {
         Say "info: $k $($up.Matches[0].Value)"
     }
     $bound = @{}
-    foreach ($k in $copies.Keys) {
+    $avatarCopies = if ($AiBody) { @('A') } else { @($copies.Keys) }
+    foreach ($k in $avatarCopies) {
         $bound[$k] = WaitFor "avatar body bound ($k)" 60 { LogLines $copies[$k] | Select-String 'avatar body bound' | Select-Object -Last 1 }
     }
-    foreach ($k in $copies.Keys) {
+    foreach ($k in $avatarCopies) {
         $l = $bound[$k].Line
         if ($l -match 'bound: (\S+) \(local body (\S+)\)') { Check "avatar body $k" ($Matches[1] -ne $Matches[2]) "avatar $($Matches[1]), local $($Matches[2])" }
         else { Check "avatar body $k" $false "old log format, cannot compare: $l" }
@@ -259,7 +290,11 @@ try {
         $rate = if ($sec -gt 0) { $rx / $sec } else { 0 }
         Check "link $k" ($rate -ge 10) ("{0:N1} packets/s received" -f $rate)
     }
-    $avB = ((LogLines $copies.B | Select-String 'avatar spawned: (\d+)' | Select-Object -Last 1).Matches[0].Groups[1].Value)
+    if ($AiBody) {
+        $n = @(LogLines $copies.B | Select-String 'avatar spawned').Count
+        Check 'no puppet avatar B' ($n -eq 0) "$n puppet spawn(s) in B"
+    }
+    else { $avB = ((LogLines $copies.B | Select-String 'avatar spawned: (\d+)' | Select-Object -Last 1).Matches[0].Groups[1].Value) }
 
     # ---- network mode: forged packets from another address (loopback) must be dropped by B ----
     if ($PeerIp -notlike '127.*') {
@@ -276,6 +311,19 @@ try {
         $d1 = [int]((LogLines $copies.B | Select-String $dropRe | Select-Object -Last 1).Matches[0].Groups[1].Value)
         $forged = @(LogLines $copies.B | Select-String 'remote=\(1\.00 1\.00 1\.00\)').Count
         Check 'forged packets dropped' (($d1 - $d0) -ge 25 -and $forged -eq 0) ("drop counter +{0} for 30 forged packets from 127.0.0.1; remote showed the forged position {1} time(s)" -f ($d1 - $d0), $forged)
+    }
+
+    # ---- optional: move B's player off A's circle (tpb moves B's cached local body) ----
+    if ($MoveBAside -gt 0) {
+        Native B "pos $pid0"
+        $p = (LogLines $copies.B | Select-String "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)" | Select-Object -Last 1).Matches[0]
+        $to = @(([double]$p.Groups[1].Value + $MoveBAside), [double]$p.Groups[2].Value, ([double]$p.Groups[3].Value + 0.5))
+        Native B ([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'tpb {0} {1} {2}', $to[0], $to[1], $to[2]))
+        Start-Sleep 3
+        Native B "pos $pid0"
+        $q = (LogLines $copies.B | Select-String "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)" | Select-Object -Last 1).Matches[0]
+        $moved = Dist2D @([double]$q.Groups[1].Value, [double]$q.Groups[2].Value) @([double]$p.Groups[1].Value, [double]$p.Groups[2].Value)
+        Check 'B moved aside' ($moved -ge $MoveBAside - 1) ("B player moved {0:N2} m (asked {1}), now z={2}" -f $moved, $MoveBAside, $q.Groups[3].Value)
     }
 
     # ---- walk A, sample B ----
@@ -307,12 +355,17 @@ try {
     $drift = if ($own.Count -ge 2) { ($own | ForEach-Object { Dist2D @($_[1], $_[2]) @($own[0][1], $own[0][2]) } | Measure-Object -Max).Maximum } else { 999 }
     Check 'walk samples' ($samples.Count -ge [int]($WalkSeconds / 2) -and $errs.Count -ge [int]($WalkSeconds / 2)) "$($samples.Count) avatar samples, $($errs.Count) paired with a remote position"
     Check 'avatar moved' ($span -ge 1.5 * $WalkRadius) ("avatar span {0:N2} m (needs >= {1:N2})" -f $span, (1.5 * $WalkRadius))
-    Check 'avatar follows A' ($maxErr -le 2.5 -and $meanErr -le 1.5) ("distance to A: mean {0:N2} m, max {1:N2} m (limits 1.5 / 2.5)" -f $meanErr, $maxErr)
+    if ($AiBody) {
+        $tps = @($bl | Where-Object { $t = Tick $_; $t -ge $startTick -and $t -le $endTick -and $_ -match 'ai: .* teleported' }).Count
+        Check 'buddy follows A' ($maxErr -le $AiMaxLimit -and $meanErr -le $AiMeanLimit) ("distance to A: mean {0:N2} m, max {1:N2} m (limits {2} / {3})" -f $meanErr, $maxErr, $AiMeanLimit, $AiMaxLimit)
+        Check 'buddy not teleported' ($tps -eq 0) "$tps teleport(s) during the walk"
+    }
+    else { Check 'avatar follows A' ($maxErr -le 2.5 -and $meanErr -le 1.5) ("distance to A: mean {0:N2} m, max {1:N2} m (limits 1.5 / 2.5)" -f $meanErr, $maxErr) }
     Check 'B player stays put' ($drift -le 0.5) ("max drift {0:N2} m over {1} samples (limit 0.5)" -f $drift, $own.Count)
 
     # ---- heading: turn A's player with the mouse, compare A's direction with B's avatar ----
     $diffs = @(); $angles = @()
-    foreach ($dx in 600, -1200, 900) {
+    foreach ($dx in $(if ($AiBody) { @() } else { 600, -1200, 900 })) {
         Guard; MouseX A $dx; Start-Sleep 3
         Native A "pos $pid0"; Native B "pos $avB"
         $la = (LogLines $copies.A | Select-String "pos ${pid0}: .* dir=\((\S+),(\S+)\)" | Select-Object -Last 1).Matches[0]
@@ -323,9 +376,11 @@ try {
         $diffs += $d; $angles += $aa
         Say ("info: heading A {0:N1} deg, B avatar {1:N1} deg, difference {2:N1} deg" -f $aa, $ab, $d)
     }
-    $turned = ($angles | Measure-Object -Max -Min | ForEach-Object { $_.Maximum - $_.Minimum })
-    Check 'A turned' ($turned -ge 30) ("A's heading range {0:N1} deg over 3 turns (needs >= 30)" -f $turned)
-    Check 'avatar heading follows A' (($diffs | Measure-Object -Max).Maximum -le 15) ("max difference {0:N1} deg (limit 15)" -f ($diffs | Measure-Object -Max).Maximum)
+    if (-not $AiBody) {
+        $turned = ($angles | Measure-Object -Max -Min | ForEach-Object { $_.Maximum - $_.Minimum })
+        Check 'A turned' ($turned -ge 30) ("A's heading range {0:N1} deg over 3 turns (needs >= 30)" -f $turned)
+        Check 'avatar heading follows A' (($diffs | Measure-Object -Max).Maximum -le 15) ("max difference {0:N1} deg (limit 15)" -f ($diffs | Measure-Object -Max).Maximum)
+    }
 
     if ($Relay) {
         foreach ($k in 'A', 'B') {
