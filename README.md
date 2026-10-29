@@ -8,10 +8,12 @@ that you drop into a **test copy** of the game. Inside the running game it
 - runs native commands (read an entity, find the player's physics body, teleport it, scan
   memory),
 - and, as a prototype, exchanges the player's position between two copies over its own UDP
-  socket and moves an invincible avatar of the peer.
+  socket and shows the peer either as an invincible puppet avatar or as an **AI body**: a
+  spawned buddy that walks and runs after the peer's position with the engine's own
+  locomotion and animation (see [AI body](#ai-body-an-animated-peer)).
 
-It is **not** a playable co-op mod: the avatar slides in an idle pose (it turns to face where
-the peer looks, but has no walking animation), with no weapons, health or mission sync. It is the code behind the Far Cry 2 write-up in
+It is **not** a playable co-op mod: there are no weapons, health or mission sync, and the AI body
+trails the peer by a few metres. It is the code behind the Far Cry 2 write-up in
 [coop-anything](https://github.com/cranebeaker/coop-anything/tree/main/games/far-cry-2)
 (pull request: https://github.com/cranebeaker/coop-anything/pull/43); the findings, dates and
 evidence are there.
@@ -29,7 +31,7 @@ evidence are there.
 
 ## Build
 
-32-bit MinGW (gcc 9.2 was used):
+32-bit MinGW (gcc 9.2 and 15.2 were used):
 
 ```
 gcc -O1 -shared -o dinput8.dll src/probe.c src/probe.def -lws2_32 -static-libgcc
@@ -65,7 +67,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | Command | What it does |
 |---|---|
 | `pos <id>` | Log position and direction of the entity (matrix at `entity+0x30`) |
-| `setpos <id> <x> <y> <z>` | Write the entity matrix position once (does not stick; the body overrides it) |
+| `setpos <id> <x> <y> <z>` | Write the entity matrix position once (does not stick for a pawn, its body overrides it; sticks for an object such as a weapon lying on the ground) |
 | `ent <id> <len>` | Log the entity object address, vtable and `len` bytes as hex, with a float column |
 | `peek <hexaddr> <len>` | Hex dump of memory (float column) |
 | `poke <hexaddr> <hex32>` / `pokef <hexaddr> <float>` | Write a 32-bit value / a float |
@@ -78,6 +80,15 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `bodyvel` / `avvel <x> <y> <z> <hexoffset>` | Write three floats into the cached / avatar body at an offset |
 | `netstart <localport> <peerip> <peerport> <id>` | Open the UDP transport and start the avatar logic (peer `127.x`: loopback only; any other address: listens on all interfaces, accepts packets from that address only) |
 | `netstop` | Stop it and remove the avatar |
+| `bodies` | Log every body of the class above with its position (AI pawns do not use this class) |
+| `ents <id> <radius>` | Log every object of the same class as the entity's object within `radius` m, with its entity id (finds nearby pawns; `GetEntityName(id)` names them) |
+| `aifollow <pawn> remote\|local\|circle [<r> <v>]` | Make an AI pawn follow the peer (`remote`), the local player (`local`, needs `findbody` first) or a test circle of radius `r` at `v` m/s (see [AI body](#ai-body-an-animated-peer)); with `remote` the puppet avatar is not spawned |
+| `aistall <ms> <m>` / `ailead <s>` / `aispeed <n>` / `aitp <m>` | Follower tuning: re-order a pawn that stood `ms` while more than `m` away (default 6000 / 3); lead the marker by `s` s of the target's velocity (default 0); MoveTo speed value (default 3); teleport distance (default 10) |
+| `aistop` | Stop the follower and remove its marker |
+
+Helpers in `scripts/`: `fc2-session.ps1` starts one test copy, loads its newest save and leaves it
+running; `fc2-lua.ps1` runs Lua in it and prints `__out` (a Lua error comes back as `LUAERROR <message>`);
+`fc2-native.ps1` sends native commands and prints the log lines they wrote.
 
 ## Two copies on one PC
 
@@ -189,6 +200,45 @@ Tested:
 - Not tested yet: Join Game or an invite while the relay is not running (Steam then starts the real Spacewar),
   longer sessions, packet loss.
 
+## AI body: an animated peer
+
+The puppet avatar is a script-spawned copy of the player pawn; it has none of the controller-side
+locomotion data, so it can only slide. An AI pawn has its own: the engine's Domino `MoveTo` command
+(`domino/system/moveto.lua` in `common.dat`:
+`CDominoManager_GetInstance():SendCommandEventToEntity(pawn, "MoveTo", destinationEntity, speed, useCombat)`)
+makes it walk or run to an entity with normal animation. The follower uses that:
+
+- The pawn is a **spawned buddy**: `SpawnEntityFromArchetype('buddies.Buddies.<Name>_Unarmed', x, y, z, 0, 0, 0)`
+  (12 names in `engine/gamemodes/gamemodesconfig.xml`, for example `Frank_Bilders`). Soldiers placed
+  in the level also obey `MoveTo` but walk back to their post; briefing characters at a faction HQ
+  ignore it (`MoveTo` runs an AI plan named in the pawn's own data, `MoveToPlanName`).
+- The destination is a **pistol on the ground** (`weapons.Secondary.Makarov`), whose position the
+  probe writes every tick. A spawned copy of the player as the destination is not neutral.
+- `MoveTo` ends on arrival, so a pawn that stood for `aistall` ms while the target is further away
+  gets a new order; a pawn more than `aitp` m behind is moved onto the marker with
+  `TeleportEntity(pawn, marker)` and ordered again. Spawned buddies start within about 1 s of an
+  order; level soldiers need 2-4 s, and re-ordering them sooner keeps them standing.
+- Registering the `MoveToStarted/Finished/Failed` callbacks (`CScriptCallbackSystem`) from a plain
+  Lua table crashed the game (null read in the Lua VM); the follower does not use them.
+
+`scripts\fc2-coop-ai.ps1 -CopyA <test copy A> -CopyB <test copy B> [-Probe dinput8.dll]` starts a
+two-copy session with an AI body in each copy (each copy's buddy follows the other copy's player) and
+switches on the engine's `ai_IgnorePlayer` and `cheat_GodMode` (assigning these Lua globals goes
+through the engine's setglobal hook into its console variables; `-NoTestSettings` leaves them off).
+
+Measured with a spawned buddy (Steam 1.03, one PC, 2026-10-28):
+
+```
+real player in copy A, 3.4 min, 58 m path, top 3.8 m/s, B's buddy following (aistall 1000 1.5, ailead 0.7):
+  distance mean 1.57 m, max 8.51 m, within 3 m 90 % of the time; 16 orders, 0 teleports, no crash lines
+scripted circle r 4 m at 1.2 m/s, 25 s:  aistall 6000 3: mean ~6 m;  aistall 1000 1.5: mean 3.36 m, max 7.04 m
+scripted circle r 6 m at 3.5 m/s, 25 s:  aistall 1000 1.5: mean 5.62-6.47 m, 3-4 teleports
+ailead 0 / 0.7 / 1.2 on the circles: no measurable difference; aispeed 1 is slower, 5 no faster than 3
+```
+
+The person playing saw the buddy walk and run with normal animation. It faces where it walks, not
+where the peer looks.
+
 ## Automated two-copy test
 
 `tests/two_copy_walk.ps1` runs the two-copy setup above without a human: it starts both test
@@ -210,6 +260,25 @@ each other, and two more checks require both relays to have carried traffic. Wit
 `-PeerIp <this PC's LAN address>` both copies use the network mode, and a further check
 sends 30 forged packets from `127.0.0.1` to copy B and requires them to be dropped. The windows
 are titled `A` and `B` so they are easy to tell apart.
+
+`-MoveBAside <m>` teleports B's own player `m` metres off A's circle before the walk (both players
+start on the same spot and the circle runs through it, so the avatar can bump B's player and fail
+`B player stays put`). `-AiBody` shows A in copy B as an AI body instead of the puppet: B spawns
+`-Buddy` (default Frank) and runs `aifollow <buddy> remote` before the link; it checks
+`buddy spawned B`, `no puppet avatar B`, `buddy follows A` (mean and max distance within
+`-AiMeanLimit` 4 / `-AiMaxLimit` 8 m) and `buddy not teleported`, and skips the heading checks.
+`-TestSettings` switches on `ai_IgnorePlayer` and `cheat_GodMode` in both copies, for saves next to
+enemies. Last AI-body run (2026-10-28, `-AiBody -TestSettings -MoveBAside 5 -WalkRadius 6 -WalkSpeed 1.5
+-WalkSeconds 25`):
+
+```
+RESULT: 21 checks, 1 failed -> FAIL
+  FAIL buddy follows A: distance to A: mean 4.39 m, max 7.34 m (limits 4 / 8)
+  link 15.6 / 16.0 packets/s; no puppet avatar B; 0 teleports; B player drift 0.00 m; no crash lines
+```
+
+The circle is harder to follow than real movement (the buddy cuts across a target that keeps
+turning; a real player was followed at 1.57 m mean), so the walk path is the next thing to change.
 
 It presses Enter and moves the mouse in the game windows, so leave keyboard and mouse alone for
 the ~2.5 minutes it runs. Exit code 0 = pass, 1 = a check failed, 2 = setup problem; `run.txt`,
@@ -242,8 +311,9 @@ heading code (the avatar stays at 0 degrees).
 
 ## Known limits
 
-The same as in the write-up: no walking animation for the avatar, no weapons, health or
-mission state, direct UDP has no NAT traversal (use the Steam relay), exact build only, and positions written into a body bypass
+The same as in the write-up: no walking animation for the puppet avatar (the AI body has it, but
+trails the peer by a few metres, takes its own route around obstacles and faces where it walks),
+no weapons, health or mission state, direct UDP has no NAT traversal (use the Steam relay), exact build only, and positions written into a body bypass
 collision (the avatar passes through scenery; it mirrors the peer's already-collided position).
 
 ## License
