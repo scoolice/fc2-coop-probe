@@ -822,6 +822,13 @@ static float g_ai_stall_m = 3.0f;
  * target keeps walking instead of arriving, stopping and waiting for the next order */
 static float g_ai_lead, g_ai_vel[2], g_ai_prev[3];
 static DWORD g_ai_prevt;
+/* a pawn cannot walk as fast as a vehicle: above g_ai_glide_on m/s of target speed it is teleported onto the marker
+ * every frame (the marker extrapolated from the last packet), back to MoveTo below g_ai_glide_off. On foot the
+ * remote player measured under 4 m/s nearly always, driving 8-12 m/s */
+static float g_ai_glide_on = 8.0f, g_ai_glide_off = 5.0f;
+static int g_ai_glide;
+static unsigned g_ai_glides;
+static DWORD g_ai_lastglide;
 static DWORD g_ai_t0, g_ai_lastlog, g_ai_lastmove, g_ai_lastorder;
 static unsigned g_ai_orders, g_ai_tps;
 /* aibody: the pawn is our own, spawned from g_ai_arch and made invincible; when it or the marker is gone (a
@@ -918,7 +925,7 @@ static int ai_target(DWORD now, float *t)
 static void ai_tick(void)
 {
     DWORD now;
-    float t[3], p[3], d, moved;
+    float t[3], p[3], d, moved, speed, lead;
     void *holder = NULL;
     BYTE *m;
     if (g_ai_src == AI_OFF || g_nstates == 0 || GetCurrentThreadId() != g_states[0].thread) return;
@@ -947,13 +954,39 @@ static void ai_tick(void)
         }
         memcpy(g_ai_prev, t, 12); g_ai_prevt = now;
     }
+    speed = sqrtf(g_ai_vel[0] * g_ai_vel[0] + g_ai_vel[1] * g_ai_vel[1]);
+    if (!g_ai_glide && g_ai_glide_on > 0 && speed > g_ai_glide_on) {
+        g_ai_glide = 1; g_ai_glides++;
+        logf_("ai: target at %.1f m/s, gliding", speed);
+    } else if (g_ai_glide && (speed < g_ai_glide_off || g_ai_glide_on <= 0)) {
+        g_ai_glide = 0;
+        logf_("ai: target at %.1f m/s, walking again", speed);
+        ai_order("glide end");
+        memcpy(g_ai_last, p, 12); g_ai_lastmove = now;
+    }
+    lead = g_ai_lead;
+    if (g_ai_glide) lead = g_ai_src == AI_REMOTE ? fminf((now - g_net_lastrx) / 1000.0f, 0.25f) : 0;
     m = entity_obj(g_ai_marker, &holder);
     if (m && !IsBadWritePtr(m + 0x60, 12)) {
         float *mp = (float *)(m + 0x60);
-        mp[0] = t[0] + g_ai_vel[0] * g_ai_lead; mp[1] = t[1] + g_ai_vel[1] * g_ai_lead; mp[2] = t[2];
+        mp[0] = t[0] + g_ai_vel[0] * lead; mp[1] = t[1] + g_ai_vel[1] * lead; mp[2] = t[2];
     }
     if (holder) (*(int *)((BYTE *)holder + 8))--;
     d = sqrtf((t[0] - p[0]) * (t[0] - p[0]) + (t[1] - p[1]) * (t[1] - p[1]));
+    if (g_ai_glide) {
+        /* PeekMessage can run several times a frame; one teleport per frame is enough */
+        if (now - g_ai_lastglide >= 15) {
+            char code[192], out[32];
+            g_ai_lastglide = now;
+            snprintf(code, sizeof code, "TeleportEntity('%llu', '%llu') __out = 'ok'", g_ai_id, g_ai_marker);
+            lua_eval(code, out, sizeof out);
+        }
+        if (now - g_ai_lastlog >= 1000) {
+            g_ai_lastlog = now;
+            logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u glide %u %.1f m/s", t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps, g_ai_glides, speed);
+        }
+        return;
+    }
     /* the pawn's position only changes on the next frame after a teleport, hence the cooldown */
     if (d > g_ai_tp && now - g_ai_lastorder > 1000) {
         char code[192], out[32];
@@ -974,12 +1007,12 @@ static void ai_tick(void)
     }
     if (now - g_ai_lastlog >= 1000) {
         g_ai_lastlog = now;
-        logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u", t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps);
+        logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u glide %u %.1f m/s", t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps, g_ai_glides, speed);
     }
 }
 
 /* aibody <archetype> <remote|local> | aifollow <pawn id> <remote|local|circle> [radius speed] | aispeed <n> |
- * aitp <metres> | aistall <ms> <metres> | ailead <seconds> | aistop */
+ * aitp <metres> | aistall <ms> <metres> | ailead <seconds> | aiglide <on m/s> <off m/s> (0 = never) | aistop */
 static int ai_cmd(const char *ln)
 {
     unsigned long long id;
@@ -991,7 +1024,7 @@ static int ai_cmd(const char *ln)
         if (strcmp(src, "remote") && strcmp(src, "local")) { logf_("ai: aibody follows remote or local"); return 1; }
         strcpy(g_ai_arch, arch);
         g_ai_src = !strcmp(src, "remote") ? AI_REMOTE : AI_LOCAL;
-        g_ai_id = g_ai_marker = 0; g_ai_orders = g_ai_tps = g_ai_spawns = 0; g_ai_lastspawn = 0; g_ai_lost = 0;
+        g_ai_id = g_ai_marker = 0; g_ai_orders = g_ai_tps = g_ai_spawns = g_ai_glides = 0; g_ai_lastspawn = 0; g_ai_lost = 0; g_ai_glide = 0;
         g_ai_t0 = g_ai_lastlog = GetTickCount(); g_ai_vel[0] = g_ai_vel[1] = 0; g_ai_prevt = 0;
         logf_("ai: body %s follows %s (spawned once there is a target)", arch, src);
         return 1;
@@ -999,6 +1032,7 @@ static int ai_cmd(const char *ln)
     if (sscanf(ln, "aispeed %d", &n) == 1) { g_ai_speed = n; logf_("ai: speed %d", n); if (g_ai_src) ai_order("speed"); return 1; }
     if (sscanf(ln, "aitp %f", &r) == 1) { g_ai_tp = r; logf_("ai: teleport distance %.1f", r); return 1; }
     if (sscanf(ln, "ailead %f", &r) == 1) { g_ai_lead = r; logf_("ai: marker leads by %.2f s", r); return 1; }
+    if (sscanf(ln, "aiglide %f %f", &r, &v) == 2) { g_ai_glide_on = r; g_ai_glide_off = v; logf_("ai: glide above %.1f m/s, walk below %.1f m/s", r, v); return 1; }
     if (sscanf(ln, "aistall %d %f", &n, &r) == 2) { g_ai_stall_ms = (DWORD)n; g_ai_stall_m = r; logf_("ai: re-order after %d ms standing, beyond %.1f m", n, r); return 1; }
     if (strncmp(ln, "aistop", 6) == 0) { ai_stop(); return 1; }
     if (sscanf(ln, "aifollow %llu %15s %f %f", &id, src, &r, &v) < 2) return 0;
@@ -1008,7 +1042,7 @@ static int ai_cmd(const char *ln)
     lua_eval(code, out, sizeof out);
     g_ai_marker = strtoull(out, NULL, 10);
     if (g_ai_marker == 0 || g_ai_marker == 0xFFFFFFFFFFFFFFFFull) { logf_("ai: marker spawn failed: %s", out); g_ai_marker = 0; return 1; }
-    g_ai_id = id; g_ai_orders = g_ai_tps = 0;
+    g_ai_id = id; g_ai_orders = g_ai_tps = g_ai_glides = 0; g_ai_glide = 0;
     g_ai_src = !strcmp(src, "remote") ? AI_REMOTE : !strcmp(src, "local") ? AI_LOCAL : AI_CIRCLE;
     if (g_ai_src == AI_CIRCLE) {
         if (r <= 0 || v <= 0) { logf_("ai: circle needs radius and speed"); ai_stop(); return 1; }
