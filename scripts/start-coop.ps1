@@ -9,6 +9,8 @@ probe log shows the save being opened (so do not use the keyboard until then), w
 through the probe's Lua channel, starts relay\fc2_relay.py with the Steam transport (host: friends-only lobby;
 join: finds the friend's lobby, retrying every 10 s), connects the probe to the relay with `netstart`, then prints
 the link state every 5 s. The join side also samples the avatar's and the own player's position every 2 s.
+With -AiBody the other player is shown as a spawned buddy that walks after their position (probe `aifollow`)
+instead of the sliding puppet; -TestSettings switches on the engine's ai_IgnorePlayer and cheat_GodMode.
 Stop with Ctrl+C or by closing the game; the logs then go to <test copy>\coop-runs\<time>\.
 
 Kill switch: if the probe log ever names the real profile folder (My Games\Far Cry 2\), the game is killed at once.
@@ -23,7 +25,10 @@ param(
     # Steam invite or click Join Game on the host in the Steam friends list
     [ValidateSet('friend', 'wait')][string]$Join = 'friend',
     [string]$PlayerId,
-    [int]$Seconds = 0
+    [int]$Seconds = 0,
+    [switch]$AiBody,
+    [string]$Buddy = 'buddies.Buddies.Frank_Bilders_Unarmed',
+    [switch]$TestSettings
 )
 $ErrorActionPreference = 'Stop'
 $kit = $PSScriptRoot
@@ -120,6 +125,22 @@ try {
     $id = WaitFor 'player id' 240 { try { $v = Lua 'tostring(GetLocalPlayerId())' } catch { if ("$_" -like 'timeout*') { $v = $null } else { throw } }; if ($v -match '^\d+$' -and $v -ne '0' -and $v -ne '18446744073709551615') { $v } }
     Say "in the world, player id $id"
     if ($PlayerId -and $PlayerId -ne $id) { Say "WARNING: expected player id $PlayerId - is it the same save on both PCs?" }
+    if ($TestSettings) {
+        # (Lua takes an expression, so the assignments run through dostring)
+        $r = Lua "tostring(dostring('ai_IgnorePlayer = 1 cheat_GodMode = 1')) .. ' ignore=' .. tostring(ai_IgnorePlayer) .. ' god=' .. tostring(cheat_GodMode)"
+        Say "test settings: $($r -replace '^.* ignore', 'ignore')"
+    }
+    $buddyId = $null
+    if ($AiBody) {
+        # before netstart, so the puppet avatar is never spawned; the buddy appears 3 m east of this player
+        Native "pos $id"
+        $p = (LogLines | Select-String "pos ${id}: x=(\S+) y=(\S+) z=(\S+)" | Select-Object -Last 1).Matches[0]
+        $buddyId = Lua ([string]::Format([Globalization.CultureInfo]::InvariantCulture, "tostring(SpawnEntityFromArchetype('{0}', {1}, {2}, {3}, 0, 0, 0))",
+                $Buddy, [double]$p.Groups[1].Value + 3, [double]$p.Groups[2].Value, [double]$p.Groups[3].Value + 0.3))
+        if ($buddyId -notmatch '^\d+$' -or $buddyId -eq '18446744073709551615') { throw "buddy spawn failed: $buddyId" }
+        Native "aistall 1000 1.5`r`nailead 0.7`r`naifollow $buddyId remote"
+        Say "AI body: buddy $buddyId ($Buddy) will follow the other player"
+    }
 
     $relay = StartRelay
     $t0 = Get-Date
@@ -139,7 +160,7 @@ try {
     Native "netstart $gamePort 127.0.0.1 $relayPort $id"
     Say "probe connected to the relay (netstart $gamePort 127.0.0.1 $relayPort)"
 
-    $avatar = $null; $last = Get-Date; $sample = Get-Date; $start = Get-Date
+    $avatar = $buddyId; $last = Get-Date; $sample = Get-Date; $start = Get-Date
     while (-not $game.HasExited -and (-not $Seconds -or ((Get-Date) - $start).TotalSeconds -lt $Seconds)) {
         Start-Sleep -Milliseconds 500; Guard
         if (-not $avatar) { $a = LogLines | Select-String 'avatar spawned: (\d+)' | Select-Object -Last 1; if ($a) { $avatar = $a.Matches[0].Groups[1].Value; Say "avatar of the other player spawned: $avatar" } }
@@ -149,6 +170,7 @@ try {
             $net = LogLines | Select-String '\] net: ' | Select-Object -Last 1
             $st = Get-Content (Join-Path $runDir 'relay.log') -ErrorAction SilentlyContinue | Select-String 'stats ' | Select-Object -Last 1
             Say ("{0} | {1}" -f $(if ($net) { $net.Line -replace '^\S+ \S+ ', '' } else { 'no net line yet' }), $(if ($st) { $st.Line } else { 'no relay stats yet' }))
+            if ($AiBody) { $ai = LogLines | Select-String '\] ai: target .* dist (\S+) orders (\d+) tps (\d+)' | Select-Object -Last 1; if ($ai) { Say ("AI body: {0} m behind, {1} orders, {2} teleports" -f $ai.Matches[0].Groups[1].Value, $ai.Matches[0].Groups[2].Value, $ai.Matches[0].Groups[3].Value) } }
             if ($relay.HasExited) { Say 'relay exited'; break }
         }
     }
