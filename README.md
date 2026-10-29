@@ -89,6 +89,8 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `aiglide <on> <off>` | Above `on` m/s of target speed (a vehicle; default 8) the pawn stops walking and is teleported onto the marker every frame, the marker extrapolated from the last packet by up to 0.25 s; below `off` m/s (default 5) it walks again. `aiglide 0 0` turns it off. A two-copy run with A moving at 10 m/s: glide on 0.5 s after the start, buddy 0.00-0.31 m from A, walking again 0.3 s after the stop |
 | `vinfo <id>` / `vphys <id> 0\|1` / `vset <id> <x> <y> <z> <yaw>` | Log an entity's physics components; switch its physics off or on; place it with `CEntity::SetEuler` / `SetPosition` (yaw in radians). The way FC2JackalFix's noclip moves the player, and safe on vehicles, where `TeleportEntity` crashes (Dunia+0x9fcf02) |
 | `winfo <pawn>` / `wadd <pawn> <weapon>` / `wsel <pawn> primary\|secondary\|hand_hand\|special` / `wdraw <pawn>` / `wholster <pawn>` | Weapons on any pawn: log its weapon manager (mode, state, weapon in hand); give it a spawned weapon entity; select a category (also draws); draw; holster |
+| `sig <pawn> <name\|0xhash>` | Send a signal (crc32 of its name) to the pawn's state driver, as the player's input does (`config/inputactionmapcommon.xml`: `startshooting`, `reload`, `jump`, ...). On an AI pawn `startshooting` does nothing |
+| `wbullet <pawn> [entity]` | Fire one bullet from the gun in the pawn's hand: a `shootbullet` animation event handed to its bullet fire strategy. Muzzle flash, no sound; the bullet follows the pawn's aim |
 | `getc <id> <rva>` | Call a `GetComponent<T>` getter (thiscall on the entity, RVA in hex) and log the component and its vtable RVA. `90930` is `CPawnNetworkComponent`: null on the campaign player, a spawned buddy and a vehicle, so the multiplayer third-party path cannot be switched on for campaign pawns as they are; `649f0` is the vehicle physics component |
 | `aistop` | Stop the follower and remove its marker |
 
@@ -289,6 +291,19 @@ natively (see the comment above `wpn_cmd` in `src/probe.c`).
 Two copies, the player of A switching weapons 11 times (machete, Star45, G3KA4, LPO50 flamethrower):
 the buddy in B drew each one within 1 s, and the owner saw him swap with them. Holstering is not
 tested yet.
+
+### Shooting
+
+Each packet also carries how many bullets the sender's guns have fired (packet magic `FC24`). The
+probe counts them in a detour on the engine's fire-one-bullet function (Dunia+0x113230, the
+shooter's id is in its first argument). The receiver fires the new ones from the buddy's gun, at most
+5 behind and 30 ms apart, while the buddy holds the peer's weapon. A gun fires on the `shootbullet`
+event of its firing animation, so the probe hands the gun's bullet fire strategy such an event (see
+the comment above `weapon_bullet`). Only bullet weapons so far, not flame, rockets, grenades or melee.
+
+Two copies, the player of A firing single shots and a burst with the G3: the buddy in B fired along
+(21+ bullets). The bullets are real (they hit the car behind the target) but follow the buddy's own
+aim, which is not synced yet, and make no sound.
 
 ## Automated two-copy test
 

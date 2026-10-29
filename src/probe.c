@@ -876,15 +876,80 @@ static void weapon_holster(void *pc)
     else if (st == 2) ((getp_t)(g_base + RVA_WM_HOLSTER2))(mgr);
 }
 
-/* winfo <pawn> | wadd <pawn> <weapon entity> | wsel <pawn> <primary|secondary|hand_hand> | wdraw <pawn> | wholster <pawn> */
+/* sends a signal to the pawn's state driver, as the player's input does (config/inputactionmapcommon.xml:
+ * mouse:lb press -> "startshooting", release -> "stopshooting"); the signal is the crc32 of its name */
+static void pawn_signal(void *pc, unsigned sig)
+{
+    ((signal_t)(g_base + RVA_SENDSIGNAL))(((getp_t)(*(void ***)pc)[0x78 / 4])(pc), sig);
+}
+
+/* A gun fires on the "shootbullet" event of its firing animation (the player's trigger, the startshooting signal,
+ * only starts that animation; it does nothing on an AI pawn): CWeaponFireBulletStrategy (vtable 10e1ea18, at
+ * weapon component + 0x10) handles animation events in vtable slot 15, comparing the event's name, an MSVC
+ * std::string at event + 8 (+0xC inline buffer, +0x1C size, +0x20 capacity; capacity < 16 = inline).
+ * The event must be a CEntityEvent (vtable 10e0f1c0; the handler casts it) and carries an entity id at +0x28.
+ * Calling that slot with such an event fires one bullet without the animation (muzzle flash, no sound), along
+ * the pawn's aim, not its facing. */
+#define RVA_WM_HELDCOMP    0x127da0
+#define RVA_BULLETSTRAT_VT 0xe1ea18
+#define RVA_ENTITYEVENT_VT 0xe0f1c0
+typedef char (__attribute__((thiscall)) *animevent_t)(void *strat, void *ev);
+
+/* FUN_10113230 (thiscall on the bullet strategy) fires a bullet; it is called from the shootbullet event above and
+ * from Dunia+0x11443d. The player's shots never reach slot 15. It takes four arguments (RET 0x10); the first holds
+ * the shooter: arg + 8 = entity holder. The local player's (g_net_id) bullets are counted for the peer. */
+#define RVA_FIREBULLET 0x113230
+typedef void (__attribute__((thiscall)) *firebullet_t)(void *strat, void *arg, void *b, void *c, void *d);
+static firebullet_t o_firebullet;
+static volatile LONG g_shots;
+static int g_shotlog;
+
+static void __attribute__((thiscall)) h_firebullet(void *strat, void *arg, void *b, void *c, void *d)
+{
+    unsigned long long who = 0;
+    BYTE *h, *e;
+    if (arg && (h = *(BYTE **)((BYTE *)arg + 8)) && (e = *(BYTE **)(h + 0xC))) who = *(unsigned long long *)(e + 8);
+    if (g_shotlog < 10) { g_shotlog++; logf_("shot: bullet from entity %llu (strategy %p)", who, strat); }
+    if (g_net_id && who == g_net_id) InterlockedIncrement(&g_shots);
+    o_firebullet(strat, arg, b, c, d);
+}
+
+static void install_shot_hook(void)
+{
+    static const BYTE want[6] = { 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00 };  /* SUB ESP,0x8c */
+    BYTE *t = g_base + RVA_FIREBULLET;
+    if (memcmp(t, want, 6) != 0) { logf_("shot hook: unexpected bytes at Dunia+0x%x, not installed", RVA_FIREBULLET); return; }
+    o_firebullet = (firebullet_t)make_detour(t, 6, h_firebullet, 1);
+    logf_("shot hook installed (Dunia+0x%x)", RVA_FIREBULLET);
+}
+
+static int weapon_bullet(void *pc, unsigned long long ent)
+{
+    void *wc = ((getp_t)(g_base + RVA_WM_HELDCOMP))(weapon_mgr(pc)), *strat;
+    void *ev[16];
+    if (!wc) return 0;
+    strat = *(void **)((BYTE *)wc + 0x10);
+    if (!strat || *(BYTE **)strat != g_base + RVA_BULLETSTRAT_VT) return -1;
+    memset(ev, 0, sizeof ev);
+    ev[0] = g_base + RVA_ENTITYEVENT_VT;
+    memcpy((BYTE *)ev + 0x28, &ent, 8);
+    strcpy((char *)ev + 0xC, "shootbullet");
+    ev[0x1C / 4] = (void *)11; ev[0x20 / 4] = (void *)15;
+    return ((animevent_t)(*(void ***)strat)[15])(strat, ev) ? 1 : 2;
+}
+
+/* winfo <pawn> | wadd <pawn> <weapon entity> | wsel <pawn> <primary|secondary|hand_hand|special> | wdraw <pawn> |
+ * wholster <pawn> | sig <pawn> <signal name, or 0x<hash>> | wbullet <pawn> [event entity, default the pawn] */
 static int wpn_cmd(const char *ln)
 {
     unsigned long long id, wid;
-    char cat[32];
+    char cat[48];
     void *holder = NULL, *pc;
     BYTE *ent, *mgr, *m;
     int op;
-    if (sscanf(ln, "winfo %llu", &id) == 1) op = 0;
+    if (sscanf(ln, "sig %llu %47s", &id, cat) == 2) op = 5;
+    else if (sscanf(ln, "wbullet %llu %llu", &id, &wid) >= 1) { op = 7; if (sscanf(ln, "wbullet %llu %llu", &id, &wid) < 2) wid = id; }
+    else if (sscanf(ln, "winfo %llu", &id) == 1) op = 0;
     else if (sscanf(ln, "wadd %llu %llu", &id, &wid) == 2) op = 1;
     else if (sscanf(ln, "wsel %llu %31s", &id, cat) == 2) op = 2;
     else if (sscanf(ln, "wdraw %llu", &id) == 1) op = 3;
@@ -896,7 +961,18 @@ static int wpn_cmd(const char *ln)
     if (!pc) { logf_("wpn %llu: no pawn component", id); goto done; }
     mgr = weapon_mgr(pc);
     m = *(BYTE **)(mgr + 4);
+    if (op == 5) {
+        unsigned h = strncmp(cat, "0x", 2) == 0 ? (unsigned)strtoul(cat, NULL, 16) : ((strhash_t)(g_base + RVA_STRHASH))(cat);
+        pawn_signal(pc, h);
+        logf_("sig %llu: %s (%08x) sent", id, cat, h);
+        goto done;
+    }
     if (!m || IsBadReadPtr(m, 0x80)) { logf_("wpn %llu: no weapon manager", id); goto done; }
+    if (op == 7) {
+        int r = weapon_bullet(pc, wid);
+        logf_("wbullet %llu (event entity %llu): %s", id, wid, r == 1 ? "shootbullet handled" : r == 2 ? "event not handled" : r < 0 ? "weapon is not a bullet weapon" : "no weapon in hand");
+        goto done;
+    }
     if (op == 0) {
         BYTE *held = weapon_held(pc);
         logf_("winfo %llu: pawn component %p manager %p inner %p mode %d state %d selected %d held %p id %llu",
@@ -916,7 +992,7 @@ static int wpn_cmd(const char *ln)
         else if (*(int *)(m + 0x78) == 1 && !((getp_t)(g_base + RVA_WM_SELECTED))(mgr) && !((getc_t)(g_base + RVA_WM_SELDEFAULT))(mgr))
             logf_("wdraw %llu: nothing to select", id);
         else {
-            ((signal_t)(g_base + RVA_SENDSIGNAL))(((getp_t)(*(void ***)pc)[0x78 / 4])(pc), SIG_DRAW);
+            pawn_signal(pc, SIG_DRAW);
             logf_("wdraw %llu: draw signal sent (mode %d)", id, *(int *)(m + 0x78));
         }
     } else {
@@ -947,10 +1023,10 @@ static void hold_tick(void)
 /* ---- own UDP transport: position exchange between two copies ---- */
 #pragma pack(push, 1)
 /* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
- * weapon in the sender's hand ("" for none) */
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; } NetPkt;
+ * weapon in the sender's hand ("" for none); shots: bullets the sender's guns fired so far */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x33324346u
+#define NET_MAGIC 0x34324346u
 static SOCKET g_ns = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static DWORD g_net_lastsend, g_net_lastlog, g_net_lastfind, g_net_lastrx;
@@ -1090,6 +1166,10 @@ static const char *const g_wpn_cats[4][2] = {
 static unsigned long long g_ai_wid[4];
 static char g_ai_warch[4][48], g_ai_wpn[48];
 static DWORD g_ai_lastwpn;
+/* the peer's shots: the count last seen in its packets (g_ai_shots_on once it is known) and bullets still to fire */
+static unsigned g_ai_shots, g_ai_pend, g_ai_fired;
+static int g_ai_shots_on;
+static DWORD g_ai_lastshot;
 static void ai_weapons_clear(void);
 
 static void ai_vehicle_release(void)
@@ -1228,6 +1308,31 @@ done:
     if (holder) (*(int *)((BYTE *)holder + 8))--;
 }
 
+/* fires the peer's new bullets from the body's gun, one every 30 ms at most and at most 5 behind; only while the
+ * body holds the peer's weapon. A count that goes back (the peer restarted) is taken as the new start. */
+static void ai_shoot(DWORD now)
+{
+    void *holder = NULL, *pc;
+    BYTE *ent;
+    unsigned d = g_remote.shots - g_ai_shots;
+    if (!g_ai_shots_on || d > 1000) { g_ai_shots = g_remote.shots; g_ai_shots_on = 1; g_ai_pend = 0; return; }
+    g_ai_shots = g_remote.shots;
+    if (strcmp(g_ai_wpn, g_remote.wpn) != 0 || !g_ai_wpn[0]) { g_ai_pend = 0; return; }
+    g_ai_pend += d;
+    if (g_ai_pend > 5) g_ai_pend = 5;
+    if (!g_ai_pend || now - g_ai_lastshot < 30) return;
+    g_ai_lastshot = now;
+    ent = entity_obj(g_ai_id, &holder);
+    pc = ent ? pawn_comp(ent) : NULL;
+    if (pc) {
+        int r = weapon_bullet(pc, g_ai_id);
+        g_ai_pend--;
+        if (r == 1 && ++g_ai_fired % 20 == 1) logf_("ai: body fired %u bullet(s) for the peer", g_ai_fired);
+        else if (r != 1) { logf_("ai: body could not fire (%d)", r); g_ai_pend = 0; }
+    }
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+}
+
 static int ai_target(DWORD now, float *t)
 {
     if (g_ai_src == AI_REMOTE) { if (g_net_rx == 0) return 0; memcpy(t, g_remote.pos, 12); return 1; }
@@ -1335,6 +1440,7 @@ static void ai_tick(void)
             return;
         }
         ai_weapon(now);
+        ai_shoot(now);
     }
     speed = sqrtf(g_ai_vel[0] * g_ai_vel[0] + g_ai_vel[1] * g_ai_vel[1]);
     if (!g_ai_glide && g_ai_glide_on > 0 && speed > g_ai_glide_on) {
@@ -1547,6 +1653,7 @@ static void net_tick(void)
             }
             memcpy(p.wpn, g_net_wpn, sizeof p.wpn);
         }
+        p.shots = (unsigned)g_shots;
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_net_veh && (obj = entity_obj(g_net_veh, &holder)) && !IsBadReadPtr(obj, 0x70)) {
             p.veh = g_net_veh;
@@ -1612,6 +1719,7 @@ static void install_lua(HMODULE m)
     o_gettop = (void *)make_detour(g_base + RVA_GETTOP, 7, h_gettop, 1);
     make_detour(g_base + RVA_ALERT, 6, h_alert, 0);
     logf_("lua hooks installed (gettop, _ALERT); command file %s", g_cmdpath);
+    install_shot_hook();
 }
 
 static DWORD WINAPI watcher(LPVOID p)
