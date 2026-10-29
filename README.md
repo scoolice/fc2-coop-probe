@@ -301,9 +301,17 @@ shooter's id is in its first argument). The receiver fires the new ones from the
 event of its firing animation, so the probe hands the gun's bullet fire strategy such an event (see
 the comment above `weapon_bullet`). Only bullet weapons so far, not flame, rockets, grenades or melee.
 
-Two copies, the player of A firing single shots and a burst with the G3: the buddy in B fired along
-(21+ bullets). The bullets are real (they hit the car behind the target) but follow the buddy's own
-aim, which is not synced yet, and make no sound.
+Each packet also carries the direction of the sender's last bullet (packet magic `FC25`). The engine
+takes a bullet's origin and direction from one of two aim functions: the camera aim for the
+player-controlled pawn (Dunia+0x112600) and the pawn's own aim for any other (Dunia+0x112080). The
+probe keeps the direction from the first, and in the second replaces the buddy's direction with the
+peer's. The bullet still starts at the buddy's muzzle, so it flies parallel to the peer's.
+
+Two copies, the player of A firing single shots, bursts, at the ground and at a car with the G3: the
+buddy in B fired along (41+ bullets), each with A's direction (for example -0.07 0.24 -0.97 for the
+shots at the ground, where his own aim was -0.71 -0.70 -0.01), and the owner saw them go the same way.
+The shots make no sound and the buddy's arms do not follow the aim. `LookAtTarget` turns him but leaves
+the barrel pointing at the ground, so it is not used.
 
 ## Automated two-copy test
 

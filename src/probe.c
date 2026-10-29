@@ -914,13 +914,60 @@ static void __attribute__((thiscall)) h_firebullet(void *strat, void *arg, void 
     o_firebullet(strat, arg, b, c, d);
 }
 
+/* FUN_10113230 takes each bullet's origin and direction from one of two aim functions, thiscall on the strategy
+ * (pawn component, origin out, direction out, pellet), RET 0x10: FUN_10112600 for the player-controlled pawn
+ * (flag 0x80 of FUN_1007e1c0() + 4, the camera aim) and FUN_10112080 for any other pawn (its own aim). The
+ * player's direction is kept for the packet; the body's is replaced with the peer's. */
+#define RVA_AIM_PLAYER 0x112600
+#define RVA_AIM_OTHER  0x112080
+typedef void (__attribute__((thiscall)) *aim_t)(void *strat, void *pc, float *org, float *dir, int pellet);
+static aim_t o_aim_player, o_aim_other;
+static float g_aim_dir[3];  /* direction of the local player's last bullet */
+static float g_peer_aim[3];  /* the peer's, used for the body's bullets when non-zero */
+static unsigned long long g_ai_id;  /* the AI body (defined with the AI state below) */
+
+static unsigned long long pc_entity_id(void *pc)
+{
+    BYTE *h = pc ? *(BYTE **)((BYTE *)pc + 8) : NULL, *e = h ? *(BYTE **)(h + 0xC) : NULL;
+    return e ? *(unsigned long long *)(e + 8) : 0;
+}
+
+static void __attribute__((thiscall)) h_aim_player(void *strat, void *pc, float *org, float *dir, int pellet)
+{
+    o_aim_player(strat, pc, org, dir, pellet);
+    if (g_net_id && pc_entity_id(pc) == g_net_id) memcpy(g_aim_dir, dir, sizeof g_aim_dir);
+}
+
+static void __attribute__((thiscall)) h_aim_other(void *strat, void *pc, float *org, float *dir, int pellet)
+{
+    static int logged;
+    o_aim_other(strat, pc, org, dir, pellet);
+    if (g_ai_id && pc_entity_id(pc) == g_ai_id && (g_peer_aim[0] != 0 || g_peer_aim[1] != 0 || g_peer_aim[2] != 0)) {
+        if (logged < 10) {
+            logged++;
+            logf_("aim: body's bullet from %.2f %.2f %.2f, own direction %.3f %.3f %.3f -> peer's %.3f %.3f %.3f", org[0], org[1], org[2],
+                  dir[0], dir[1], dir[2], g_peer_aim[0], g_peer_aim[1], g_peer_aim[2]);
+        }
+        memcpy(dir, g_peer_aim, sizeof g_peer_aim);
+    }
+}
+
+static void *detour_checked(unsigned rva, const BYTE *want, int n, void *hook, const char *what)
+{
+    BYTE *t = g_base + rva;
+    if (memcmp(t, want, n) != 0) { logf_("%s hook: unexpected bytes at Dunia+0x%x, not installed", what, rva); return NULL; }
+    logf_("%s hook installed (Dunia+0x%x)", what, rva);
+    return make_detour(t, n, hook, 1);
+}
+
 static void install_shot_hook(void)
 {
-    static const BYTE want[6] = { 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00 };  /* SUB ESP,0x8c */
-    BYTE *t = g_base + RVA_FIREBULLET;
-    if (memcmp(t, want, 6) != 0) { logf_("shot hook: unexpected bytes at Dunia+0x%x, not installed", RVA_FIREBULLET); return; }
-    o_firebullet = (firebullet_t)make_detour(t, 6, h_firebullet, 1);
-    logf_("shot hook installed (Dunia+0x%x)", RVA_FIREBULLET);
+    static const BYTE sub8c[6] = { 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00 };  /* SUB ESP,0x8c */
+    static const BYTE frame[6] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0 };  /* PUSH EBP; MOV EBP,ESP; AND ESP,-16 */
+    void *p;
+    if ((p = detour_checked(RVA_FIREBULLET, sub8c, 6, h_firebullet, "shot"))) o_firebullet = (firebullet_t)p;
+    if ((p = detour_checked(RVA_AIM_PLAYER, frame, 6, h_aim_player, "player aim"))) o_aim_player = (aim_t)p;
+    if ((p = detour_checked(RVA_AIM_OTHER, frame, 6, h_aim_other, "pawn aim"))) o_aim_other = (aim_t)p;
 }
 
 static int weapon_bullet(void *pc, unsigned long long ent)
@@ -1023,10 +1070,11 @@ static void hold_tick(void)
 /* ---- own UDP transport: position exchange between two copies ---- */
 #pragma pack(push, 1)
 /* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
- * weapon in the sender's hand ("" for none); shots: bullets the sender's guns fired so far */
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; } NetPkt;
+ * weapon in the sender's hand ("" for none); shots: bullets the sender's guns fired so far; aim: direction of the
+ * sender's last bullet */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x34324346u
+#define NET_MAGIC 0x35324346u
 static SOCKET g_ns = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static DWORD g_net_lastsend, g_net_lastlog, g_net_lastfind, g_net_lastrx;
@@ -1617,6 +1665,7 @@ static void net_tick(void)
         if (r != (int)sizeof p || p.magic != NET_MAGIC || from.sin_addr.s_addr != g_peer.sin_addr.s_addr) { g_net_drop++; continue; }
         p.wpn[sizeof p.wpn - 1] = 0;
         g_remote = p; g_net_rx++; g_net_lastrx = now;
+        memcpy(g_peer_aim, p.aim, sizeof g_peer_aim);
     }
     /* with an AI body following the peer, the puppet avatar is not spawned */
     if (g_ai_src != AI_REMOTE) av_tick(now);
@@ -1654,6 +1703,7 @@ static void net_tick(void)
             memcpy(p.wpn, g_net_wpn, sizeof p.wpn);
         }
         p.shots = (unsigned)g_shots;
+        memcpy(p.aim, g_aim_dir, sizeof p.aim);
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_net_veh && (obj = entity_obj(g_net_veh, &holder)) && !IsBadReadPtr(obj, 0x70)) {
             p.veh = g_net_veh;
