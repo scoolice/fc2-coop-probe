@@ -897,12 +897,15 @@ typedef char (__attribute__((thiscall)) *animevent_t)(void *strat, void *ev);
 
 /* FUN_10113230 (thiscall on the bullet strategy) fires a bullet; it is called from the shootbullet event above and
  * from Dunia+0x11443d. The player's shots never reach slot 15. It takes four arguments (RET 0x10); the first holds
- * the shooter: arg + 8 = entity holder. The local player's (g_net_id) bullets are counted for the peer. */
+ * the shooter: arg + 8 = entity holder. The local player's (g_net_id) bullets are counted for the peer. The muted
+ * pawn's (g_mute_id) own bullets are dropped; only those fired through weapon_bullet (g_own_shot) go out. */
 #define RVA_FIREBULLET 0x113230
 typedef void (__attribute__((thiscall)) *firebullet_t)(void *strat, void *arg, void *b, void *c, void *d);
 static firebullet_t o_firebullet;
 static volatile LONG g_shots;
-static int g_shotlog;
+static int g_shotlog, g_own_shot;
+static unsigned long long g_mute_id;
+static unsigned g_muted;
 
 static void __attribute__((thiscall)) h_firebullet(void *strat, void *arg, void *b, void *c, void *d)
 {
@@ -916,6 +919,19 @@ static void __attribute__((thiscall)) h_firebullet(void *strat, void *arg, void 
               *(int *)(s + 0x134), *(BYTE *)(s + 0x100), *(float *)(s + 0x14C), b, c, d);
     }
     if (g_net_id && who == g_net_id) InterlockedIncrement(&g_shots);
+    if (g_mute_id && who == g_mute_id && !g_own_shot) {
+        if (g_muted < 3) {  /* the call path: Dunia code addresses found on the stack */
+            DWORD *sp = (DWORD *)__builtin_frame_address(0);
+            char line[512];
+            int i, k = 0;
+            for (i = 0; i < 160 && k < 480; i++)
+                if (sp[i] >= (DWORD)g_base + 0x1000 && sp[i] < (DWORD)g_base + 0xa30000) k += sprintf(line + k, " %06lx", sp[i] - (DWORD)g_base);
+            line[k] = 0;
+            logf_("shot: own bullet path%s", line);
+        }
+        if (g_muted++ % 50 == 0) logf_("shot: dropped %u own bullet(s) of %llu", g_muted, who);
+        return;
+    }
     o_firebullet(strat, arg, b, c, d);
 }
 
@@ -968,11 +984,77 @@ static void *detour_checked(unsigned rva, const BYTE *want, int n, void *hook, c
     return make_detour(t, n, hook, 1);
 }
 
+/* The bullet strategy's StartShoot (slot 10, FUN_10113580, thiscall (strategy, pawn component), RET 4) plays the shot
+ * sound and sends the pawn the "start_shoot" animation event. Skipped for the muted pawn, whose AI aims and wants to fire. */
+#define RVA_STARTSHOOT 0x113580
+typedef void (__attribute__((thiscall)) *startshoot_t)(void *strat, void *pc);
+static startshoot_t o_startshoot;
+
+static void __attribute__((thiscall)) h_startshoot(void *strat, void *pc)
+{
+    static unsigned n;
+    if (g_mute_id && pc && pc_entity_id(pc) == g_mute_id) { if (n++ % 20 == 0) logf_("shot: skipped %u start-shooting of %llu", n, g_mute_id); return; }
+    o_startshoot(strat, pc);
+}
+
+/* CTaskShoot's per-frame fire step (FUN_109797e0, fastcall on the task, RET) aims the pawn and raises its fire input:
+ * bit 0x04 of byte +6 of the pawn's control block (pawn data + 0x140; the pawn component is *(*(task+0x34)+0x268)).
+ * For the muted pawn the bit is cleared again right after, so its AI keeps aiming but does not fire. */
+#define RVA_AIFIRE 0x9797e0
+typedef void (__attribute__((fastcall)) *aifire_t)(void *task);
+static aifire_t o_aifire;
+static void *g_mute_agent;  /* the muted pawn's AI agent, as its shoot task last showed it */
+
+static void __attribute__((fastcall)) h_aifire(void *task)
+{
+    static unsigned n;
+    BYTE *agent = *(BYTE **)((BYTE *)task + 0x34), *pc = agent ? *(BYTE **)(agent + 0x268) : NULL;
+    o_aifire(task);
+    if (g_mute_id && pc && pc_entity_id(pc) == g_mute_id) {
+        g_mute_agent = agent;
+        *(*(BYTE **)(pc + 0x10) + 0x140 + 6) &= ~4;
+        if (n++ % 200 == 0) logf_("shot: held %u fire input(s) of %llu", n, g_mute_id);
+    }
+}
+
+/* FUN_109ffa20 (thiscall on the AI agent, (bit, on), RET 8) sets or clears one bit of the agent's 64-bit state mask
+ * (+0x190); CTaskShoot sets bit 0x31 when it starts firing and clears bit 0x32 when it stops. Other objects use it
+ * too, so the muted pawn's agent is only recognised by the pointer its shoot task gave (g_mute_agent): its changes
+ * are logged, and bit g_mute_bit is never set. */
+#define RVA_AGENTBIT 0x9ffa20
+typedef void (__attribute__((thiscall)) *agentbit_t)(void *agent, int bit, int on);
+static agentbit_t o_agentbit;
+static int g_mute_bit = -1;
+
+static void __attribute__((thiscall)) h_agentbit(void *agent, int bit, int on)
+{
+    static int n;
+    unsigned long long *mask = (unsigned long long *)((BYTE *)agent + 0x190), was;
+    if (g_mute_id && agent && agent == g_mute_agent) {
+        int skip = (on & 0xFF) && bit == g_mute_bit;
+        was = *mask;
+        if (!skip) o_agentbit(agent, bit, on);
+        if ((skip ? was | (1ULL << bit) : *mask) != was && n < 200) {
+            n++;
+            logf_("agent bit 0x%x %s%s, mask now %016llx", bit, on & 0xFF ? "on" : "off", skip ? " (held)" : "", *mask);
+        }
+        return;
+    }
+    o_agentbit(agent, bit, on);
+}
+
 static void install_shot_hook(void)
 {
     static const BYTE sub8c[6] = { 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00 };  /* SUB ESP,0x8c */
     static const BYTE frame[6] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0 };  /* PUSH EBP; MOV EBP,ESP; AND ESP,-16 */
+    static const BYTE sub1c[5] = { 0x83, 0xEC, 0x1C, 0x53, 0x56 };  /* SUB ESP,0x1c; PUSH EBX; PUSH ESI */
+    static const BYTE agbit[7] = { 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x08 };  /* PUSH ESI; MOV ESI,ECX; MOV ECX,[ESP+8] */
+    BYTE sub38[8] = { 0x83, 0xEC, 0x38, 0xA1 };  /* SUB ESP,0x38; MOV EAX,[Dunia+0x1645a74] */
     void *p;
+    *(BYTE **)(sub38 + 4) = g_base + 0x1645a74;
+    if ((p = detour_checked(RVA_STARTSHOOT, sub38, 8, h_startshoot, "start shooting"))) o_startshoot = (startshoot_t)p;
+    if ((p = detour_checked(RVA_AIFIRE, sub1c, 5, h_aifire, "AI fire"))) o_aifire = (aifire_t)p;
+    if ((p = detour_checked(RVA_AGENTBIT, agbit, 7, h_agentbit, "agent state"))) o_agentbit = (agentbit_t)p;
     if ((p = detour_checked(RVA_FIREBULLET, sub8c, 6, h_firebullet, "shot"))) o_firebullet = (firebullet_t)p;
     if ((p = detour_checked(RVA_AIM_PLAYER, frame, 6, h_aim_player, "player aim"))) o_aim_player = (aim_t)p;
     if ((p = detour_checked(RVA_AIM_OTHER, frame, 6, h_aim_other, "pawn aim"))) o_aim_other = (aim_t)p;
@@ -982,6 +1064,7 @@ static int weapon_bullet(void *pc, unsigned long long ent)
 {
     void *wc = ((getp_t)(g_base + RVA_WM_HELDCOMP))(weapon_mgr(pc)), *strat;
     void *ev[16];
+    char r;
     if (!wc) return 0;
     strat = *(void **)((BYTE *)wc + 0x10);
     if (!strat || *(BYTE **)strat != g_base + RVA_BULLETSTRAT_VT) return -1;
@@ -990,12 +1073,15 @@ static int weapon_bullet(void *pc, unsigned long long ent)
     memcpy((BYTE *)ev + 0x28, &ent, 8);
     strcpy((char *)ev + 0xC, "shootbullet");
     ev[0x1C / 4] = (void *)11; ev[0x20 / 4] = (void *)15;
-    return ((animevent_t)(*(void ***)strat)[15])(strat, ev) ? 1 : 2;
+    g_own_shot = 1;
+    r = ((animevent_t)(*(void ***)strat)[15])(strat, ev);
+    g_own_shot = 0;
+    return r ? 1 : 2;
 }
 
 /* winfo <pawn> | wadd <pawn> <weapon entity> | wsel <pawn> <primary|secondary|hand_hand|special> | wdraw <pawn> |
  * wholster <pawn> | sig <pawn> <signal name, or 0x<hash>> | wbullet <pawn> [event entity, default the pawn] |
- * wfire <pawn> <dx dy dz>: one bullet along that direction */
+ * wfire <pawn> <dx dy dz>: one bullet along that direction | wmute <pawn|0>: drop that pawn's own bullets */
 static int wpn_cmd(const char *ln)
 {
     unsigned long long id, wid;
@@ -1006,6 +1092,8 @@ static int wpn_cmd(const char *ln)
     float fd[3];
     if (sscanf(ln, "wfire %llu %f %f %f", &id, &fd[0], &fd[1], &fd[2]) == 4) { op = 7; wid = id; }
     else if (sscanf(ln, "sig %llu %47s", &id, cat) == 2) op = 5;
+    else if (sscanf(ln, "wmutebit %i", &op) == 1) { g_mute_bit = op; logf_("wmutebit: agent bit 0x%x held", op); return 1; }
+    else if (sscanf(ln, "wmute %llu", &id) == 1) { g_mute_id = id; g_muted = 0; g_mute_agent = NULL; logf_("wmute: %llu's own bullets %s", id, id ? "dropped" : "(none muted)"); return 1; }
     else if (sscanf(ln, "wbullet %llu %llu", &id, &wid) >= 1) { op = 7; if (sscanf(ln, "wbullet %llu %llu", &id, &wid) < 2) wid = id; }
     else if (sscanf(ln, "winfo %llu", &id) == 1) op = 0;
     else if (sscanf(ln, "wadd %llu %llu", &id, &wid) == 2) op = 1;
