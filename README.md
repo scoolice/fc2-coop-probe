@@ -75,6 +75,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `findbody <id>` | Find the Havok body (class vtable RVA `0xE67658`) nearest to the entity and cache it |
 | `posb` / `tpb <x> <y> <z>` | Read / write the cached body's position (teleport) |
 | `walk <radius> <seconds> <speed>` | Move the cached (local) body on a circle every frame (needs `netstart` running) |
+| `walklegs <speed> <pause> <dx1> <dy1> [...]` | Move the cached (local) body along up to 8 straight legs relative to its start, pausing `pause` s after each (needs `netstart` running) |
 | `hold <id> <x> <y> <z>` / `unhold` | Write the entity matrix position every tick (does not stick; kept as the negative test) |
 | `follow <id> <hex offsets>` / `tp <id> <x> <y> <z> <hex offsets>` | Follow a pointer chain from the entity; write the position at its end |
 | `bodyvel` / `avvel <x> <y> <z> <hexoffset>` | Write three floats into the cached / avatar body at an offset |
@@ -278,7 +279,19 @@ RESULT: 21 checks, 1 failed -> FAIL
 ```
 
 The circle is harder to follow than real movement (the buddy cuts across a target that keeps
-turning; a real player was followed at 1.57 m mean), so the walk path is the next thing to change.
+turning; a real player was followed at 1.57 m mean). `-WalkLegs "<speed> <pause> <dx1> <dy1> ..."`
+walks A along straight legs relative to its start with a pause at each corner (probe command
+`walklegs`) instead of the circle. A 10 m x 8 m rectangle west of the start, 2 s pauses:
+
+```
+-WalkLegs "1.5 2 -10 0 0 8 10 0 0 -8"  (walking, 32 s):  21 checks, 1 failed
+  FAIL buddy follows A: mean 3.07 m, max 8.12 m (limits 4 / 8); 0 teleports
+-WalkLegs "3.5 2 -10 0 0 8 10 0 0 -8"  (running, 18 s):  21 checks, 2 failed
+  FAIL buddy follows A: mean 4.99 m, max 9.89 m;  FAIL buddy not teleported: 2 teleports
+```
+
+The buddy needs about a second to start after each order, so it falls furthest behind at the
+start of each leg and when the peer runs.
 
 It presses Enter and moves the mouse in the game windows, so leave keyboard and mouse alone for
 the ~2.5 minutes it runs. Exit code 0 = pass, 1 = a check failed, 2 = setup problem; `run.txt`,

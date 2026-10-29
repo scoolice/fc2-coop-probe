@@ -33,6 +33,9 @@ param(
     [double]$WalkRadius = 3,
     [double]$WalkSeconds = 20,
     [double]$WalkSpeed = 2,
+    # instead of the circle: "<speed> <pause s> <dx1> <dy1> [<dx2> <dy2> ...]", straight legs relative to A's start,
+    # each followed by a pause (probe `walklegs`), a path shaped like play
+    [string]$WalkLegs,
     # metres to teleport B's own player in +x before the walk. Both copies start on the same spot and
     # A's circle (from its start towards -x) runs through it, so the avatar can bump B's player.
     # 0 keeps B on the circle.
@@ -328,7 +331,20 @@ try {
 
     # ---- walk A, sample B ----
     $startTick = Tick ((LogLines $copies.B)[-1])
-    Native A ("walk {0} {1} {2}" -f $WalkRadius, $WalkSeconds, $WalkSpeed)
+    # the path's size decides how far the avatar must move for 'avatar moved'
+    $needSpan = 1.5 * $WalkRadius
+    if ($WalkLegs) {
+        $v = @($WalkLegs -split '\s+' | Where-Object { $_ } | ForEach-Object { [double]::Parse($_, [Globalization.CultureInfo]::InvariantCulture) })
+        $x = 0; $y = 0; $xs = @(0); $ys = @(0); $WalkSeconds = 0
+        for ($i = 2; $i + 1 -lt $v.Count; $i += 2) {
+            $WalkSeconds += [math]::Sqrt($v[$i] * $v[$i] + $v[$i + 1] * $v[$i + 1]) / $v[0] + $v[1]
+            $x += $v[$i]; $y += $v[$i + 1]; $xs += $x; $ys += $y
+        }
+        $needSpan = 0.75 * [math]::Max((($xs | Measure-Object -Max).Maximum - ($xs | Measure-Object -Min).Minimum), (($ys | Measure-Object -Max).Maximum - ($ys | Measure-Object -Min).Minimum))
+        Native A "walklegs $WalkLegs"
+        Say ("info: walklegs path, {0:N1} s" -f $WalkSeconds)
+    }
+    else { Native A ("walk {0} {1} {2}" -f $WalkRadius, $WalkSeconds, $WalkSpeed) }
     $t0 = Get-Date
     while (((Get-Date) - $t0).TotalSeconds -lt ($WalkSeconds + 3)) { Guard; Native B "pos $avB`r`npos $pid0"; Start-Sleep -Milliseconds 800 }
     $endTick = Tick ((LogLines $copies.B)[-1])
@@ -354,7 +370,7 @@ try {
     $meanErr = if ($errs.Count) { ($errs | Measure-Object -Average).Average } else { 999 }
     $drift = if ($own.Count -ge 2) { ($own | ForEach-Object { Dist2D @($_[1], $_[2]) @($own[0][1], $own[0][2]) } | Measure-Object -Max).Maximum } else { 999 }
     Check 'walk samples' ($samples.Count -ge [int]($WalkSeconds / 2) -and $errs.Count -ge [int]($WalkSeconds / 2)) "$($samples.Count) avatar samples, $($errs.Count) paired with a remote position"
-    Check 'avatar moved' ($span -ge 1.5 * $WalkRadius) ("avatar span {0:N2} m (needs >= {1:N2})" -f $span, (1.5 * $WalkRadius))
+    Check 'avatar moved' ($span -ge $needSpan) ("avatar span {0:N2} m (needs >= {1:N2})" -f $span, $needSpan)
     if ($AiBody) {
         $tps = @($bl | Where-Object { $t = Tick $_; $t -ge $startTick -and $t -le $endTick -and $_ -match 'ai: .* teleported' }).Count
         Check 'buddy follows A' ($maxErr -le $AiMaxLimit -and $meanErr -le $AiMeanLimit) ("distance to A: mean {0:N2} m, max {1:N2} m (limits {2} / {3})" -f $meanErr, $maxErr, $AiMeanLimit, $AiMaxLimit)

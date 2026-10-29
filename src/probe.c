@@ -331,9 +331,12 @@ typedef void *(__attribute__((thiscall)) *getent_t)(void *mgr, void **out, unsig
 #define RVA_BODY_VTABLE 0xE67658
 static BYTE *g_body, *g_bodymat;
 static BYTE **g_av_body_p;
-static int g_walk;
+static int g_walk;  /* 1 = circle (walk), 2 = straight legs with pauses (walklegs) */
 static float g_walk_c[3], g_walk_r, g_walk_secs, g_walk_speed;
 static DWORD g_walk_t0;
+#define MAXLEGS 8
+static float g_legs[MAXLEGS][2], g_leg_pause;
+static int g_nlegs;
 static int g_net_cfg;  /* 1 = start requested, 2 = running */
 static unsigned g_net_lport, g_net_pport;
 static char g_net_pip[32];
@@ -533,6 +536,24 @@ static void native_cmd(const char *ln)
         g_walk_c[0] = *(float *)(g_bodymat + 0x30); g_walk_c[1] = *(float *)(g_bodymat + 0x34); g_walk_c[2] = *(float *)(g_bodymat + 0x38);
         g_walk_r = fx; g_walk_secs = fy; g_walk_speed = fz; g_walk_t0 = GetTickCount(); g_walk = 1;
         logf_("walk: radius %.2f for %.1f s at %.2f m/s around %.2f %.2f %.2f (start on circle edge)", fx, fy, fz, g_walk_c[0], g_walk_c[1], g_walk_c[2]);
+    } else if (strncmp(ln, "walklegs ", 9) == 0) {
+        /* walklegs <speed> <pause s> <dx1> <dy1> [<dx2> <dy2> ...]: straight legs relative to the start, each
+         * followed by a pause; a path shaped like play, unlike the circle */
+        char *c = (char *)ln + 9;
+        float total = 0;
+        int k;
+        if (!g_bodymat || IsBadReadPtr(g_bodymat, 0x40)) { logf_("walklegs: no cached body"); return; }
+        g_walk_speed = strtof(c, &c); g_leg_pause = strtof(c, &c);
+        for (g_nlegs = 0; g_nlegs < MAXLEGS; g_nlegs++) {
+            char *e;
+            g_legs[g_nlegs][0] = strtof(c, &e); if (e == c) break; c = e;
+            g_legs[g_nlegs][1] = strtof(c, &e); if (e == c) break; c = e;
+        }
+        if (g_walk_speed <= 0 || g_nlegs == 0) { logf_("walklegs: needs a speed and at least one leg"); return; }
+        for (k = 0; k < g_nlegs; k++) total += sqrtf(g_legs[k][0] * g_legs[k][0] + g_legs[k][1] * g_legs[k][1]) / g_walk_speed + g_leg_pause;
+        g_walk_c[0] = *(float *)(g_bodymat + 0x30); g_walk_c[1] = *(float *)(g_bodymat + 0x34); g_walk_c[2] = *(float *)(g_bodymat + 0x38);
+        g_walk_secs = total; g_walk_t0 = GetTickCount(); g_walk = 2;
+        logf_("walklegs: %d legs at %.2f m/s, %.1f s pauses, %.1f s in all, from %.2f %.2f %.2f", g_nlegs, g_walk_speed, g_leg_pause, total, g_walk_c[0], g_walk_c[1], g_walk_c[2]);
     } else if (sscanf(ln, "bodyvel %f %f %f %lx", &fx, &fy, &fz, &a) == 4) {
         if (!g_body || IsBadWritePtr(g_body + a, 12)) { logf_("bodyvel: bad body/offset"); return; }
         *(float *)(g_body + a) = fx; *(float *)(g_body + a + 4) = fy; *(float *)(g_body + a + 8) = fz;
@@ -953,6 +974,19 @@ static void net_tick(void)
     if (g_walk && g_bodymat && !IsBadWritePtr(g_bodymat, 0x40)) {
         float t = (GetTickCount() - g_walk_t0) / 1000.0f;
         if (t > g_walk_secs) { g_walk = 0; logf_("walk finished"); }
+        else if (g_walk == 2) {
+            /* find the leg (or the pause after it) that time t falls in */
+            float x = g_walk_c[0], y = g_walk_c[1];
+            int k;
+            for (k = 0; k < g_nlegs; k++) {
+                float len = sqrtf(g_legs[k][0] * g_legs[k][0] + g_legs[k][1] * g_legs[k][1]), dur = len / g_walk_speed;
+                if (t < dur) { x += g_legs[k][0] * t / dur; y += g_legs[k][1] * t / dur; break; }
+                x += g_legs[k][0]; y += g_legs[k][1]; t -= dur;
+                if (t < g_leg_pause) break;
+                t -= g_leg_pause;
+            }
+            *(float *)(g_bodymat + 0x30) = x; *(float *)(g_bodymat + 0x34) = y; *(float *)(g_bodymat + 0x38) = g_walk_c[2];
+        }
         else {
             float ang = g_walk_speed * t / g_walk_r;
             *(float *)(g_bodymat + 0x30) = g_walk_c[0] + g_walk_r * (cosf(ang) - 1.0f);
