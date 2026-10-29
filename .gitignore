@@ -7,3 +7,5 @@ scripts/steam-run/
 relay/steam-run/
 __pycache__/
 scripts/steam/
+scripts/dxvk/
+scripts/jackalfix/

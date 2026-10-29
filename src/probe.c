@@ -395,6 +395,7 @@ static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
 static BYTE *entity_obj(unsigned long long id, void **holder_out);
 static int ai_cmd(const char *ln);
 static int veh_cmd(const char *ln);
+static int wpn_cmd(const char *ln);
 /* exclude: a body to skip (the local player's when binding the avatar: both stand on the same spot
  * after loading the same save, so the nearest body would otherwise be the player's own) */
 static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, const BYTE *exclude)
@@ -666,7 +667,7 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "poke %lx %lx", &a, &pv) == 2) {
         if (IsBadWritePtr((void *)a, 4)) logf_("poke %lx: not writable", a);
         else { *(unsigned long *)a = pv; logf_("poke %lx = %08lx", a, pv); }
-    } else if (!ai_cmd(ln) && !veh_cmd(ln)) logf_("native: unknown command: %s", ln);
+    } else if (!ai_cmd(ln) && !veh_cmd(ln) && !wpn_cmd(ln)) logf_("native: unknown command: %s", ln);
 }
 
 static void run_native(void)
@@ -769,6 +770,129 @@ static int veh_cmd(const char *ln)
         logf_("vset %llu: placed at %.3f %.3f %.3f yaw %.3f, now %.3f %.3f %.3f", id, v[0], v[1], v[2], v[3],
               *(float *)(ent + 0x60), *(float *)(ent + 0x64), *(float *)(ent + 0x68));
     }
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    return 1;
+}
+
+/* ---- weapons on any pawn ----
+ * The Lua AddWeapon / SelectWeapon / DrawWeapon / HolsterWeapon bindings (registered in FUN_109fc830) look up the
+ * local player and then only use its pawn component (tag 0xfde384, class checked through vtable +4), so the same
+ * steps work on an AI pawn. Weapon manager = *(pawn component + 0x10) + 0x4F0; its methods load *(mgr + 4) first.
+ * Inner state m = *(mgr + 4): +0x10 holder of the weapon in hand, +0x18 selected slot, +0x74 state, +0x78 mode
+ * (1 weapon, 2 gadget). Draw sends signal 0x2a47e3a3 to the state driver (pawn component vtable +0x78). */
+#define RVA_PAWNTAG_REG    0x040a50
+#define RVA_PAWNTAG_FLAG   0xfde374
+#define RVA_PAWNTAG        0xfde384
+#define RVA_PAWNCLASS_REG  0x040a80
+#define RVA_PAWNCLASS_FLAG 0xfde388
+#define RVA_PAWNCLASS      0xfde39c
+#define RVA_WPNTAG_REG     0x0987e0
+#define RVA_WPNTAG_FLAG    0xfe01e0
+#define RVA_WPNTAG         0xfe01f8
+#define RVA_WM_SLOT        0x129de0  /* weapon component in a slot */
+#define RVA_WM_REMOVE      0x12e3e0  /* (weapon, 0) */
+#define RVA_WM_ADD         0x1289f0  /* (weapon component) */
+#define RVA_WM_SELECT      0x12ce80  /* (&category hash) */
+#define RVA_WM_SELDEFAULT  0x12b310
+#define RVA_WM_SELECTED    0x129d90
+#define RVA_WM_HOLSTER1    0x12b340
+#define RVA_WM_HOLSTER2    0x12b350
+#define RVA_STRHASH        0x229400  /* cdecl (const char *) */
+#define RVA_SENDSIGNAL     0x29da10
+#define SIG_DRAW           0x2a47e3a3u
+typedef void *(__attribute__((thiscall)) *getp_t)(void *self);
+typedef void *(__attribute__((thiscall)) *getp1_t)(void *self, void *a);
+typedef void (__attribute__((thiscall)) *call2_t)(void *self, void *a, int b);
+typedef char (__attribute__((thiscall)) *getc_t)(void *self);
+typedef void (__attribute__((thiscall)) *signal_t)(void *driver, unsigned sig);
+typedef unsigned (__cdecl *strhash_t)(const char *);
+
+static void *pawn_comp(BYTE *ent)
+{
+    void *c;
+    BYTE *type;
+    if (*(int *)(g_base + RVA_PAWNTAG_FLAG) == 0) ((reg_t)(g_base + RVA_PAWNTAG_REG))(NULL);
+    c = ((getcomp_t)(g_base + RVA_GETCOMPONENT))(ent, g_base + RVA_PAWNTAG);
+    if (!c) return NULL;
+    if (*(int *)(g_base + RVA_PAWNCLASS_FLAG) == 0) ((reg_t)(g_base + RVA_PAWNCLASS_REG))(NULL);
+    type = ((getp_t)(*(void ***)c)[1])(c);
+    if (!type || *(unsigned *)(type + 4) < 4 || *(unsigned *)(type + 0x14) != *(unsigned *)(g_base + RVA_PAWNCLASS)) return NULL;
+    return c;
+}
+
+static void *weapon_comp(BYTE *ent)
+{
+    if (*(int *)(g_base + RVA_WPNTAG_FLAG) == 0) ((reg_t)(g_base + RVA_WPNTAG_REG))(NULL);
+    return ((getcomp_t)(g_base + RVA_GETCOMPONENT))(ent, g_base + RVA_WPNTAG);
+}
+
+static BYTE *weapon_mgr(void *pc) { return *(BYTE **)((BYTE *)pc + 0x10) + 0x4F0; }
+
+/* the entity of the weapon in the pawn's hand, or NULL */
+static BYTE *weapon_held(void *pc)
+{
+    BYTE *m = *(BYTE **)(weapon_mgr(pc) + 4), *h = *(BYTE **)(m + 0x10);
+    return h ? *(BYTE **)(h + 0xC) : NULL;
+}
+
+/* winfo <pawn> | wadd <pawn> <weapon entity> | wsel <pawn> <primary|secondary|hand_hand> | wdraw <pawn> | wholster <pawn> */
+static int wpn_cmd(const char *ln)
+{
+    unsigned long long id, wid;
+    char cat[32];
+    void *holder = NULL, *pc;
+    BYTE *ent, *mgr, *m;
+    int op;
+    if (sscanf(ln, "winfo %llu", &id) == 1) op = 0;
+    else if (sscanf(ln, "wadd %llu %llu", &id, &wid) == 2) op = 1;
+    else if (sscanf(ln, "wsel %llu %31s", &id, cat) == 2) op = 2;
+    else if (sscanf(ln, "wdraw %llu", &id) == 1) op = 3;
+    else if (sscanf(ln, "wholster %llu", &id) == 1) op = 4;
+    else return 0;
+    ent = entity_obj(id, &holder);
+    if (!ent || IsBadReadPtr(ent, 0x70)) { logf_("wpn %llu: no entity", id); goto done; }
+    pc = pawn_comp(ent);
+    if (!pc) { logf_("wpn %llu: no pawn component", id); goto done; }
+    mgr = weapon_mgr(pc);
+    m = *(BYTE **)(mgr + 4);
+    if (!m || IsBadReadPtr(m, 0x80)) { logf_("wpn %llu: no weapon manager", id); goto done; }
+    if (op == 0) {
+        BYTE *held = weapon_held(pc);
+        logf_("winfo %llu: pawn component %p manager %p inner %p mode %d state %d selected %d held %p id %llu",
+              id, pc, mgr, m, *(int *)(m + 0x78), *(int *)(m + 0x74), *(int *)(m + 0x18), held, held ? *(unsigned long long *)(held + 8) : 0ULL);
+        hexdump_(m, 0x80);
+    } else if (op == 1) {
+        void *wh = NULL, *wc, *old;
+        BYTE *w = entity_obj(wid, &wh);
+        unsigned slot;
+        if (!w || !(wc = weapon_comp(w))) logf_("wadd %llu: %llu is not a weapon", id, wid);
+        else {
+            slot = (unsigned)(size_t)((getp_t)(*(void ***)wc)[0x8C / 4])(wc);
+            old = ((getp1_t)(g_base + RVA_WM_SLOT))(mgr, (void *)(size_t)slot);
+            if (old) ((call2_t)(g_base + RVA_WM_REMOVE))(mgr, old, 0);
+            ((getp1_t)(g_base + RVA_WM_ADD))(mgr, wc);
+            logf_("wadd %llu: weapon %llu component %p slot %u (replaced %p)", id, wid, wc, slot, old);
+        }
+        if (wh) (*(int *)((BYTE *)wh + 8))--;
+    } else if (op == 2) {
+        unsigned h = ((strhash_t)(g_base + RVA_STRHASH))(cat);
+        ((getp1_t)(g_base + RVA_WM_SELECT))(mgr, &h);
+        logf_("wsel %llu: %s (hash %08x), selected now %d", id, cat, h, *(int *)(m + 0x18));
+    } else if (op == 3) {
+        if (*(int *)(m + 0x78) == 1 && weapon_held(pc)) logf_("wdraw %llu: already in hand", id);
+        else if (*(int *)(m + 0x78) == 1 && !((getp_t)(g_base + RVA_WM_SELECTED))(mgr) && !((getc_t)(g_base + RVA_WM_SELDEFAULT))(mgr))
+            logf_("wdraw %llu: nothing to select", id);
+        else {
+            ((signal_t)(g_base + RVA_SENDSIGNAL))(((getp_t)(*(void ***)pc)[0x78 / 4])(pc), SIG_DRAW);
+            logf_("wdraw %llu: draw signal sent (mode %d)", id, *(int *)(m + 0x78));
+        }
+    } else {
+        int st = *(int *)(m + 0x74);
+        if (st == 1) ((getp_t)(g_base + RVA_WM_HOLSTER1))(mgr);
+        else if (st == 2) ((getp_t)(g_base + RVA_WM_HOLSTER2))(mgr);
+        logf_("wholster %llu: state %d", id, st);
+    }
+done:
     if (holder) (*(int *)((BYTE *)holder + 8))--;
     return 1;
 }

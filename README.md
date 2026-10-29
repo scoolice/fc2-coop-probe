@@ -171,7 +171,13 @@ is a stand-in that relays over plain UDP, used by the test to run the whole chai
 - `scripts/setup-copy.ps1 -Letter A|B -PrivateDir <folder> [-Probe <dinput8.dll>]`: finds the game, checks
   the Dunia.dll hash, copies the install to `<drive>\fc2-coop\test-<letter>`, backs up and applies the three
   patches above (checks 17 changed bytes), installs the probe, and creates `Documents\My Games\FC2test_<letter>`
-  from `-PrivateDir` (one `GamerProfile.xml` and the one `.sav` both PCs load).
+  from `-PrivateDir` (one `GamerProfile.xml` and the one `.sav` both PCs load). Installs FC2JackalFix and DXVK
+  too when the folders below exist.
+- `scripts/get-jackalfix.ps1`: downloads FC2JackalFix V1 (borderless window etc.) into `scripts\jackalfix`, hashes checked.
+  With it, its ASI loader is `bin\dinput8.dll` and the probe goes in as `bin\coop_probe.asi`.
+- `scripts/get-dxvk.ps1`: downloads DXVK 3.1.1 into `scripts\dxvk`, hashes checked, and keeps the 32-bit
+  `d3d10core.dll`, `d3d11.dll`, `dxgi.dll` (the game's D3D10 renderer) and `d3d9.dll` (its D3D9 renderer). Delete
+  the four from `bin` to go back to the system's Direct3D.
 - `scripts/get-steam-api.ps1`: downloads Steamworks.NET Standalone 2025.164.1 and checks the zip and
   `steam_api64.dll` hashes.
 - `scripts/start-coop.ps1 -Role host|join -TestDir <copy> -SteamDll <steam_api64.dll> [-Python <python.exe>]

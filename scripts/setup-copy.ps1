@@ -15,7 +15,9 @@ Does not touch the real install, the real profile or the real saves.
      jackalfix folder get-jackalfix.ps1 makes, used when it exists) the ASI loader becomes bin\dinput8.dll, the probe
      bin\coop_probe.asi, and a new bin\plugins\FC2JackalFix.ini gets DisplayMode -DisplayMode (2 borderless,
      3 windowed), Invincibility 1 (JackalFix rewrites god mode every frame, which would undo -TestSettings),
-     LargeAddressAware 0 (never rewrites FarCry2.exe), SkipIntro 0 and SkipTitleScreen 0 (start-coop's Enter presses)
+     LargeAddressAware 0 (never rewrites FarCry2.exe), SkipIntro 0 and SkipTitleScreen 0 (start-coop's Enter presses).
+     With DXVK (-Dxvk, default the dxvk folder get-dxvk.ps1 makes, used when it exists) its 32-bit d3d10core, d3d11,
+     dxgi and d3d9 DLLs go into bin as well
   5. creates Documents\My Games\FC2test_<letter> with GamerProfile.xml and Saved Games\<save>.sav from -PrivateDir
      (a GamerProfile.xml and the one .sav both PCs load; keep these private)
 
@@ -28,6 +30,7 @@ param(
     [string]$GameDir,
     [string]$TestDir,
     [string]$JackalFix,
+    [string]$Dxvk,
     [ValidateSet(2, 3)][int]$DisplayMode = 2,
     [string]$Documents = [Environment]::GetFolderPath('MyDocuments')
 )
@@ -35,6 +38,7 @@ $ErrorActionPreference = 'Stop'
 # Windows PowerShell 5.1 leaves $PSScriptRoot empty in the defaults of a script with [Parameter()] attributes
 if (-not $Probe) { $Probe = Join-Path $PSScriptRoot 'dinput8.dll' }
 if (-not $JackalFix) { $JackalFix = Join-Path $PSScriptRoot 'jackalfix' }
+if (-not $Dxvk) { $Dxvk = Join-Path $PSScriptRoot 'dxvk' }
 $wantDunia = '6353936a54aa841350bb30ff005727859cdef1aa10c209209b220b399e862765'
 $name = "FC2test_$Letter"
 function Say($m) { Write-Output ("[setup] " + $m) }
@@ -144,6 +148,10 @@ if (Test-Path (Join-Path $JackalFix 'bin\plugins\FC2JackalFix.asi')) {
 else {
     Copy-Item $Probe (Join-Path $bin 'dinput8.dll') -Force
     Say 'probe dinput8.dll installed in the test copy'
+}
+if (Test-Path (Join-Path $Dxvk 'd3d11.dll')) {
+    foreach ($f in 'd3d10core.dll', 'd3d11.dll', 'dxgi.dll', 'd3d9.dll') { Copy-Item (Join-Path $Dxvk $f) (Join-Path $bin $f) -Force }
+    Say 'DXVK installed (d3d10core, d3d11, dxgi, d3d9 in bin)'
 }
 
 # 5. test profile
