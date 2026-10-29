@@ -291,7 +291,9 @@ walks A along straight legs relative to its start with a pause at each corner (p
 ```
 
 The buddy needs about a second to start after each order, so it falls furthest behind at the
-start of each leg and when the peer runs.
+start of each leg and when the peer runs. The walking run again with `-Relay` (both probes through
+two `fc2_relay.py` processes, udp transport): 23 checks, 1 failed (`buddy follows A`: mean 2.98 m,
+max 9.19 m, 0 teleports); the relays carried 759 / 703 packets each way with 0 dropped.
 
 It presses Enter and moves the mouse in the game windows, so leave keyboard and mouse alone for
 the ~2.5 minutes it runs. Exit code 0 = pass, 1 = a check failed, 2 = setup problem; `run.txt`,
