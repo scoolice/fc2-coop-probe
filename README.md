@@ -88,6 +88,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `aistall <ms> <m>` / `ailead <s>` / `aispeed <n>` / `aitp <m>` | Follower tuning: re-order a pawn that stood `ms` while more than `m` away (default 6000 / 3); lead the marker by `s` s of the target's velocity (default 0); MoveTo speed value (default 3); teleport distance (default 10) |
 | `aiglide <on> <off>` | Above `on` m/s of target speed (a vehicle; default 8) the pawn stops walking and is teleported onto the marker every frame, the marker extrapolated from the last packet by up to 0.25 s; below `off` m/s (default 5) it walks again. `aiglide 0 0` turns it off. A two-copy run with A moving at 10 m/s: glide on 0.5 s after the start, buddy 0.00-0.31 m from A, walking again 0.3 s after the stop |
 | `vinfo <id>` / `vphys <id> 0\|1` / `vset <id> <x> <y> <z> <yaw>` | Log an entity's physics components; switch its physics off or on; place it with `CEntity::SetEuler` / `SetPosition` (yaw in radians). The way FC2JackalFix's noclip moves the player, and safe on vehicles, where `TeleportEntity` crashes (Dunia+0x9fcf02) |
+| `winfo <pawn>` / `wadd <pawn> <weapon>` / `wsel <pawn> primary\|secondary\|hand_hand\|special` / `wdraw <pawn>` / `wholster <pawn>` | Weapons on any pawn: log its weapon manager (mode, state, weapon in hand); give it a spawned weapon entity; select a category (also draws); draw; holster |
 | `getc <id> <rva>` | Call a `GetComponent<T>` getter (thiscall on the entity, RVA in hex) and log the component and its vtable RVA. `90930` is `CPawnNetworkComponent`: null on the campaign player, a spawned buddy and a vehicle, so the multiplayer third-party path cannot be switched on for campaign pawns as they are; `649f0` is the vehicle physics component |
 | `aistop` | Stop the follower and remove its marker |
 
@@ -271,6 +272,23 @@ in is left alone. Old builds drop the new packets (magic `FC22`), so both sides 
 Two copies, the player of A driving the save's Datsun for 25 s: the buddy in B got into the driver's
 seat with its animation 1.0 s after A got in, and B's Datsun stayed a median 0.22 m (max 0.39 m while
 driving) from A's.
+
+### Weapons
+
+Each packet also carries the archetype of the weapon in the sender's hand (`weapons.Primary.AK47`, empty
+for none), read from the player's weapon manager and named with `GetEntityName` when it changes. The
+receiver spawns that archetype, gives it to the buddy and selects its category (`hand_hand`,
+`secondary`, `primary`, `special`, from the archetype's prefix), which draws it; it keeps one spawned
+weapon per category and rechecks once a second. Nothing in the peer's hand holsters the buddy's
+weapon. Only names of letters, digits, `.` and `_` are used, as they go into Lua code. The packet magic
+is now `FC23`, so both sides need this build.
+
+The game's Lua weapon functions only act on the player, so the probe takes the same steps on the buddy
+natively (see the comment above `wpn_cmd` in `src/probe.c`).
+
+Two copies, the player of A switching weapons 11 times (machete, Star45, G3KA4, LPO50 flamethrower):
+the buddy in B drew each one within 1 s, and the owner saw him swap with them. Holstering is not
+tested yet.
 
 ## Automated two-copy test
 

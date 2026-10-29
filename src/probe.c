@@ -831,8 +831,49 @@ static BYTE *weapon_mgr(void *pc) { return *(BYTE **)((BYTE *)pc + 0x10) + 0x4F0
 /* the entity of the weapon in the pawn's hand, or NULL */
 static BYTE *weapon_held(void *pc)
 {
-    BYTE *m = *(BYTE **)(weapon_mgr(pc) + 4), *h = *(BYTE **)(m + 0x10);
+    BYTE *m = *(BYTE **)(weapon_mgr(pc) + 4), *h;
+    if (!m) return NULL;
+    h = *(BYTE **)(m + 0x10);
     return h ? *(BYTE **)(h + 0xC) : NULL;
+}
+
+/* id of the weapon (mode 1, not a gadget) in the pawn entity's hand, 0 for none */
+static unsigned long long held_weapon_id(BYTE *ent)
+{
+    void *pc = ent ? pawn_comp(ent) : NULL;
+    BYTE *m, *w;
+    if (!pc || !(m = *(BYTE **)(weapon_mgr(pc) + 4)) || *(int *)(m + 0x78) != 1) return 0;
+    w = weapon_held(pc);
+    return w ? *(unsigned long long *)(w + 8) : 0;
+}
+
+/* gives the pawn the weapon entity w (replacing what it has in that slot); returns w's weapon component or NULL */
+static void *weapon_give(void *pc, BYTE *w)
+{
+    BYTE *mgr = weapon_mgr(pc);
+    void *wc = weapon_comp(w), *old;
+    unsigned slot;
+    if (!wc) return NULL;
+    slot = (unsigned)(size_t)((getp_t)(*(void ***)wc)[0x8C / 4])(wc);
+    old = ((getp1_t)(g_base + RVA_WM_SLOT))(mgr, (void *)(size_t)slot);
+    if (old) ((call2_t)(g_base + RVA_WM_REMOVE))(mgr, old, 0);
+    ((getp1_t)(g_base + RVA_WM_ADD))(mgr, wc);
+    return wc;
+}
+
+/* selecting a category also draws its weapon */
+static void weapon_select(void *pc, const char *cat)
+{
+    unsigned h = ((strhash_t)(g_base + RVA_STRHASH))(cat);
+    ((getp1_t)(g_base + RVA_WM_SELECT))(weapon_mgr(pc), &h);
+}
+
+static void weapon_holster(void *pc)
+{
+    BYTE *mgr = weapon_mgr(pc), *m = *(BYTE **)(mgr + 4);
+    int st = m ? *(int *)(m + 0x74) : 0;
+    if (st == 1) ((getp_t)(g_base + RVA_WM_HOLSTER1))(mgr);
+    else if (st == 2) ((getp_t)(g_base + RVA_WM_HOLSTER2))(mgr);
 }
 
 /* winfo <pawn> | wadd <pawn> <weapon entity> | wsel <pawn> <primary|secondary|hand_hand> | wdraw <pawn> | wholster <pawn> */
@@ -862,22 +903,14 @@ static int wpn_cmd(const char *ln)
               id, pc, mgr, m, *(int *)(m + 0x78), *(int *)(m + 0x74), *(int *)(m + 0x18), held, held ? *(unsigned long long *)(held + 8) : 0ULL);
         hexdump_(m, 0x80);
     } else if (op == 1) {
-        void *wh = NULL, *wc, *old;
+        void *wh = NULL, *wc;
         BYTE *w = entity_obj(wid, &wh);
-        unsigned slot;
-        if (!w || !(wc = weapon_comp(w))) logf_("wadd %llu: %llu is not a weapon", id, wid);
-        else {
-            slot = (unsigned)(size_t)((getp_t)(*(void ***)wc)[0x8C / 4])(wc);
-            old = ((getp1_t)(g_base + RVA_WM_SLOT))(mgr, (void *)(size_t)slot);
-            if (old) ((call2_t)(g_base + RVA_WM_REMOVE))(mgr, old, 0);
-            ((getp1_t)(g_base + RVA_WM_ADD))(mgr, wc);
-            logf_("wadd %llu: weapon %llu component %p slot %u (replaced %p)", id, wid, wc, slot, old);
-        }
+        if (!w || !(wc = weapon_give(pc, w))) logf_("wadd %llu: %llu is not a weapon", id, wid);
+        else logf_("wadd %llu: weapon %llu component %p", id, wid, wc);
         if (wh) (*(int *)((BYTE *)wh + 8))--;
     } else if (op == 2) {
-        unsigned h = ((strhash_t)(g_base + RVA_STRHASH))(cat);
-        ((getp1_t)(g_base + RVA_WM_SELECT))(mgr, &h);
-        logf_("wsel %llu: %s (hash %08x), selected now %d", id, cat, h, *(int *)(m + 0x18));
+        weapon_select(pc, cat);
+        logf_("wsel %llu: %s, category hash now %08x", id, cat, *(unsigned *)(m + 0x18));
     } else if (op == 3) {
         if (*(int *)(m + 0x78) == 1 && weapon_held(pc)) logf_("wdraw %llu: already in hand", id);
         else if (*(int *)(m + 0x78) == 1 && !((getp_t)(g_base + RVA_WM_SELECTED))(mgr) && !((getc_t)(g_base + RVA_WM_SELDEFAULT))(mgr))
@@ -887,10 +920,8 @@ static int wpn_cmd(const char *ln)
             logf_("wdraw %llu: draw signal sent (mode %d)", id, *(int *)(m + 0x78));
         }
     } else {
-        int st = *(int *)(m + 0x74);
-        if (st == 1) ((getp_t)(g_base + RVA_WM_HOLSTER1))(mgr);
-        else if (st == 2) ((getp_t)(g_base + RVA_WM_HOLSTER2))(mgr);
-        logf_("wholster %llu: state %d", id, st);
+        logf_("wholster %llu: state %d", id, *(int *)(m + 0x74));
+        weapon_holster(pc);
     }
 done:
     if (holder) (*(int *)((BYTE *)holder + 8))--;
@@ -915,10 +946,11 @@ static void hold_tick(void)
 
 /* ---- own UDP transport: position exchange between two copies ---- */
 #pragma pack(push, 1)
-/* veh: the vehicle the sender is in (0 on foot), with its position and forward vector */
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; } NetPkt;
+/* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
+ * weapon in the sender's hand ("" for none) */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x32324346u
+#define NET_MAGIC 0x33324346u
 static SOCKET g_ns = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static DWORD g_net_lastsend, g_net_lastlog, g_net_lastfind, g_net_lastrx;
@@ -927,6 +959,9 @@ static NetPkt g_remote;
 /* the local player's vehicle, asked from the engine once a second (0 on foot) */
 static unsigned long long g_net_veh;
 static DWORD g_net_lastveh;
+/* the weapon in the local player's hand; its name is asked from the engine when the entity changes */
+static unsigned long long g_net_wid;
+static char g_net_wpn[48];
 static unsigned long long g_av_id;
 static BYTE *g_av_body, *g_av_mat;
 static void av_init_ptr(void) { g_av_body_p = &g_av_body; }
@@ -1048,6 +1083,14 @@ static unsigned g_ai_spawns, g_ai_stuck;
 static unsigned long long g_ai_veh, g_ai_noveh;
 static int g_ai_seated, g_ai_seattries;
 static DWORD g_ai_lastseat;
+/* the peer's weapon on our body: one spawned weapon entity per category, and what the body last got */
+static const char *const g_wpn_cats[4][2] = {
+    { "weapons.HandToHand.", "hand_hand" }, { "weapons.Secondary.", "secondary" },
+    { "weapons.Primary.", "primary" }, { "weapons.Special.", "special" } };
+static unsigned long long g_ai_wid[4];
+static char g_ai_warch[4][48], g_ai_wpn[48];
+static DWORD g_ai_lastwpn;
+static void ai_weapons_clear(void);
 
 static void ai_vehicle_release(void)
 {
@@ -1110,7 +1153,7 @@ static void ai_stop(void)
         lua_eval(code, out, sizeof out);
     }
     remove_entity(g_ai_marker);
-    if (g_ai_arch[0]) remove_entity(g_ai_id);
+    if (g_ai_arch[0]) { remove_entity(g_ai_id); ai_weapons_clear(); }
     logf_("ai: stopped (%u orders, %u teleports, %u spawns)", g_ai_orders, g_ai_tps, g_ai_spawns);
     g_ai_src = AI_OFF; g_ai_id = g_ai_marker = 0; g_ai_arch[0] = 0;
 }
@@ -1122,6 +1165,7 @@ static void ai_spawn(const float *t, const char *why)
     lua_eval("__out = tostring(IsEntityValid(GetLocalPlayerId()))", out, sizeof out);
     if (strcmp(out, "1") != 0) return;
     remove_entity(g_ai_marker); remove_entity(g_ai_id);
+    ai_weapons_clear();
     g_ai_id = g_ai_marker = 0;
     g_ai_marker = spawn_at("weapons.Secondary.Makarov", t[0], t[1], t[2] + 0.5f);
     if (g_ai_marker) g_ai_id = spawn_at(g_ai_arch, t[0] + 1.0f, t[1], t[2] + 0.3f);
@@ -1134,6 +1178,54 @@ static void ai_spawn(const float *t, const char *why)
     memcpy(g_ai_last, t, 12); g_ai_lastmove = GetTickCount();
     logf_("ai: body spawned %llu (%s, %s), marker %llu, invincible %s, spawns %u", g_ai_id, g_ai_arch, why, g_ai_marker, out, g_ai_spawns);
     ai_order("spawn");
+}
+
+static void ai_weapons_clear(void)
+{
+    int k;
+    for (k = 0; k < 4; k++) { remove_entity(g_ai_wid[k]); g_ai_wid[k] = 0; g_ai_warch[k][0] = 0; }
+    g_ai_wpn[0] = 0;
+}
+
+/* once a second while the body's weapon differs from the peer's: spawn the peer's weapon (once per category),
+ * give it to the body and select its category, which draws it; nothing in the peer's hand holsters */
+static void ai_weapon(DWORD now)
+{
+    void *holder = NULL, *wh = NULL, *pc;
+    BYTE *ent, *w;
+    const char *want = g_remote.wpn, *c;
+    char code[128], out[16];
+    int k;
+    if (!strcmp(g_ai_wpn, want) || now - g_ai_lastwpn < 1000) return;
+    g_ai_lastwpn = now;
+    for (c = want; *c; c++) if (!isalnum((unsigned char)*c) && *c != '.' && *c != '_') break;
+    for (k = 0; k < 4 && strncmp(want, g_wpn_cats[k][0], strlen(g_wpn_cats[k][0])); k++) ;
+    if (*want && (*c || k == 4)) { logf_("ai: peer holds %.47s, not a weapon archetype; ignored", want); strcpy(g_ai_wpn, want); return; }
+    snprintf(code, sizeof code, "__out = tostring(IsEntityLoaded('%llu'))", g_ai_id);
+    lua_eval(code, out, sizeof out);
+    if (strcmp(out, "1") != 0) return;
+    ent = entity_obj(g_ai_id, &holder);
+    pc = ent ? pawn_comp(ent) : NULL;
+    if (!pc) { logf_("ai: body has no pawn component, no weapon"); strcpy(g_ai_wpn, want); goto done; }
+    if (!*want) { weapon_holster(pc); logf_("ai: peer holds nothing, body holsters"); strcpy(g_ai_wpn, want); goto done; }
+    if (strcmp(g_ai_warch[k], want) != 0) {
+        float p[3];
+        unsigned long long old = g_ai_wid[k], id;
+        if (!ent_pos(g_ai_id, p)) goto done;
+        id = spawn_at(want, p[0], p[1], p[2] + 1.0f);
+        if (!id) { strcpy(g_ai_wpn, want); goto done; }
+        w = entity_obj(id, &wh);
+        if (!w || !weapon_give(pc, w)) { logf_("ai: %s %llu is not a weapon", want, id); remove_entity(id); strcpy(g_ai_wpn, want); goto done; }
+        remove_entity(old);
+        g_ai_wid[k] = id; strcpy(g_ai_warch[k], want);
+        logf_("ai: body given %s (%llu)", want, id);
+    }
+    weapon_select(pc, g_wpn_cats[k][1]);
+    strcpy(g_ai_wpn, want);
+    logf_("ai: body draws %s (%s)", want, g_wpn_cats[k][1]);
+done:
+    if (wh) (*(int *)((BYTE *)wh + 8))--;
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
 }
 
 static int ai_target(DWORD now, float *t)
@@ -1242,6 +1334,7 @@ static void ai_tick(void)
             ai_spawn(t, "peer left the vehicle");
             return;
         }
+        ai_weapon(now);
     }
     speed = sqrtf(g_ai_vel[0] * g_ai_vel[0] + g_ai_vel[1] * g_ai_vel[1]);
     if (!g_ai_glide && g_ai_glide_on > 0 && speed > g_ai_glide_on) {
@@ -1416,6 +1509,7 @@ static void net_tick(void)
         int r = recvfrom(g_ns, (char *)&p, sizeof p, 0, (struct sockaddr *)&from, &fl);
         if (r == SOCKET_ERROR) { if (WSAGetLastError() == WSAEMSGSIZE) { g_net_drop++; continue; } break; }
         if (r != (int)sizeof p || p.magic != NET_MAGIC || from.sin_addr.s_addr != g_peer.sin_addr.s_addr) { g_net_drop++; continue; }
+        p.wpn[sizeof p.wpn - 1] = 0;
         g_remote = p; g_net_rx++; g_net_lastrx = now;
     }
     /* with an AI body following the peer, the puppet avatar is not spawned */
@@ -1440,6 +1534,19 @@ static void net_tick(void)
         p.magic = NET_MAGIC; p.seq = ++g_net_seq;
         memcpy(p.pos, g_bodymat + 0x30, sizeof p.pos);
         p.dir[0] = obj ? *(float *)(obj + 0x30) : 0; p.dir[1] = obj ? *(float *)(obj + 0x34) : 0;
+        {
+            unsigned long long wid = held_weapon_id(obj);
+            if (wid != g_net_wid) {
+                char code[96];
+                g_net_wid = wid; g_net_wpn[0] = 0;
+                if (wid) {
+                    snprintf(code, sizeof code, "__out = tostring(GetEntityName('%llu'))", wid);
+                    lua_eval(code, g_net_wpn, sizeof g_net_wpn);
+                }
+                logf_("net: local player holds %s", wid ? g_net_wpn : "nothing");
+            }
+            memcpy(p.wpn, g_net_wpn, sizeof p.wpn);
+        }
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_net_veh && (obj = entity_obj(g_net_veh, &holder)) && !IsBadReadPtr(obj, 0x70)) {
             p.veh = g_net_veh;
