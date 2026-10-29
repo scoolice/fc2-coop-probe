@@ -1438,13 +1438,15 @@ static int ai_drive(DWORD now, const float *t, const float *p)
     yaw = atan2f(g_remote.vfwd[1], g_remote.vfwd[0]) - 1.5707963f;
     ent_place(v, pos, yaw);
     if (holder) (*(int *)((BYTE *)holder + 8))--;
-    /* seating waits for the pawn to have loaded, as the game's VehicleRide box does */
+    /* seating waits for the pawn to have loaded, as the game's VehicleRide box does; CVehicle_GetCurrentVehicle
+     * on a pawn that is not there reads a null pointer (Dunia+0xe7337) */
     if (!g_ai_seated && now - g_ai_lastseat >= 1000) {
         g_ai_lastseat = now;
         snprintf(code, sizeof code,
+                 "if IsEntityValid('%llu') ~= 1 or IsEntityLoaded('%llu') ~= 1 then __out = 'wait' else "
                  "local v = CVehicle_GetCurrentVehicle('%llu') if v and tostring(v:GetEntity()) == '%llu' then __out = 'in' "
-                 "elseif IsEntityLoaded('%llu') == 1 then SetupVehicleFollowPath('%llu', '%llu', GetInvalidEntityId()) __out = 'seat' "
-                 "else __out = 'wait' end", g_ai_id, g_ai_veh, g_ai_id, g_ai_veh, g_ai_id);
+                 "else SetupVehicleFollowPath('%llu', '%llu', GetInvalidEntityId()) __out = 'seat' end end",
+                 g_ai_id, g_ai_id, g_ai_id, g_ai_veh, g_ai_veh, g_ai_id);
         lua_eval(code, out, sizeof out);
         if (strcmp(out, "in") == 0) { g_ai_seated = 1; logf_("ai: body seated in vehicle %llu", g_ai_veh); }
         else if (++g_ai_seattries == 6) logf_("ai: body still not seated after 6 tries (%s)", out);
@@ -1455,6 +1457,65 @@ static int ai_drive(DWORD now, const float *t, const float *p)
         logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u glide %u veh %llu seated %d",
               t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps, g_ai_glides, g_ai_veh, g_ai_seated);
     }
+    return 1;
+}
+
+/* When the local player goes down, the game spawns its rescue buddy (GetBuddiesManager():GetRescueBuddyEntityId(),
+ * asked once a second), who revives them. Our body steps aside at once so there are not two of him. Nothing may
+ * touch the rescuer during the rescue (a teleport then left his model invisible), and afterwards the game's buddy
+ * brain overrides our orders and he runs off. He stays and fights until he has killed an enemy, then hangs
+ * around. So once he has come within 4 m of the player and has stayed beyond RESCUE_DONE_M for RESCUE_DONE_S
+ * checks in a row (short dashes in the fight do not count), or after g_ai_rescue_ms, or when the game removes
+ * him, our body is spawned where he stands and he is removed. Returns 1 while waiting. The game does not offer
+ * another rescue for a while after one. */
+#define RESCUE_DONE_M 8.0f
+#define RESCUE_DONE_S 5
+static unsigned long long g_ai_rescuer;
+static int g_ai_rescue_wait, g_ai_rescue_near, g_ai_rescue_far;
+static DWORD g_ai_rescue_t, g_ai_lastrescq, g_ai_rescue_ms = 180000;
+
+static int ai_rescue(DWORD now)
+{
+    char code[192], out[32];
+    float rp[3], d = -1;
+    if (g_ai_src != AI_REMOTE || !g_ai_arch[0] || !g_ai_rescue_ms || now - g_ai_lastrescq < 1000) return g_ai_rescue_wait;
+    g_ai_lastrescq = now;
+    if (!g_ai_rescue_wait) {
+        unsigned long long r;
+        lua_eval("__out = tostring(GetBuddiesManager():GetRescueBuddyEntityId())", out, sizeof out);
+        r = strtoull(out, NULL, 10);
+        if (r == 0xFFFFFFFFFFFFFFFFull || r == g_ai_rescuer || r == g_ai_id) return 0;
+        logf_("ai: the game spawned rescue buddy %llu; our body steps aside until the rescue is over", r);
+        g_ai_rescuer = r; g_ai_rescue_t = now; g_ai_rescue_wait = 1; g_ai_rescue_near = 0; g_ai_rescue_far = 0;
+        ai_vehicle_release();
+        remove_entity(g_ai_id); ai_weapons_clear();
+        g_ai_id = 0;
+        return 1;
+    }
+    snprintf(code, sizeof code, "__out = tostring(IsEntityValid('%llu'))", g_ai_rescuer);
+    lua_eval(code, out, sizeof out);
+    if (strcmp(out, "1") != 0 || !ent_pos(g_ai_rescuer, rp)) {
+        logf_("ai: rescue buddy %llu is gone, our body comes back", g_ai_rescuer);
+        g_ai_rescue_wait = 0;
+        return 0;
+    }
+    if (g_bodymat && !IsBadReadPtr(g_bodymat, 0x40)) {
+        const float *lp = (const float *)(g_bodymat + 0x30);
+        d = sqrtf((rp[0] - lp[0]) * (rp[0] - lp[0]) + (rp[1] - lp[1]) * (rp[1] - lp[1]));
+        if (d < 4.0f && !g_ai_rescue_near) { g_ai_rescue_near = 1; logf_("ai: rescue buddy reached the player"); }
+    }
+    g_ai_rescue_far = g_ai_rescue_near && d > RESCUE_DONE_M ? g_ai_rescue_far + 1 : 0;
+    if (g_ai_rescue_far < RESCUE_DONE_S && now - g_ai_rescue_t < g_ai_rescue_ms) return 1;
+    logf_("ai: rescue over (%s, %.1f m from the player after %lu s); our body takes his place",
+          g_ai_rescue_far >= RESCUE_DONE_S ? "he stays away" : "timeout", d, (unsigned long)((now - g_ai_rescue_t) / 1000));
+    g_ai_rescue_wait = 0;
+    g_ai_lastspawn = now;
+    ai_spawn(rp, "after the rescue");
+    /* GetBuddiesManager():RemoveBuddyFromWorld(id, true) leaves him in the world; RemoveEntity removes him */
+    remove_entity(g_ai_rescuer);
+    snprintf(code, sizeof code, "__out = tostring(IsEntityValid('%llu'))", g_ai_rescuer);
+    lua_eval(code, out, sizeof out);
+    logf_("ai: rescue buddy %llu removed (still valid: %s)", g_ai_rescuer, out);
     return 1;
 }
 
@@ -1476,6 +1537,7 @@ static void ai_tick(void)
         lua_eval(code, out, sizeof out);
         if (strcmp(out, "11") != 0 && !g_ai_lost) { logf_("ai: body or marker gone (valid %s)", out); g_ai_lost = 1; }
     }
+    if (ai_rescue(now)) return;
     if (g_ai_lost || !g_ai_id || !ent_pos(g_ai_id, p) || !entity_obj(g_ai_marker, &holder)) {
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_ai_arch[0] && now - g_ai_lastspawn > 3000) { g_ai_lastspawn = now; ai_spawn(t, g_ai_spawns ? "lost, respawn" : "first"); }
@@ -1562,7 +1624,8 @@ static void ai_tick(void)
 }
 
 /* aibody <archetype> <remote|local> | aifollow <pawn id> <remote|local|circle> [radius speed] | aispeed <n> |
- * aitp <metres> | aistall <ms> <metres> | ailead <seconds> | aiglide <on m/s> <off m/s> (0 = never) | aistop */
+ * aitp <metres> | aistall <ms> <metres> | ailead <seconds> | aiglide <on m/s> <off m/s> (0 = never) |
+ * airescue <seconds> (0 = off) | aistop */
 static int ai_cmd(const char *ln)
 {
     unsigned long long id;
@@ -1576,7 +1639,7 @@ static int ai_cmd(const char *ln)
         g_ai_src = !strcmp(src, "remote") ? AI_REMOTE : AI_LOCAL;
         ai_vehicle_release();
         g_ai_id = g_ai_marker = 0; g_ai_orders = g_ai_tps = g_ai_spawns = g_ai_glides = 0; g_ai_lastspawn = 0; g_ai_lost = 0; g_ai_glide = 0;
-        g_ai_noveh = 0;
+        g_ai_noveh = 0; g_ai_rescue_wait = 0; g_ai_rescuer = 0;
         g_ai_t0 = g_ai_lastlog = GetTickCount(); g_ai_vel[0] = g_ai_vel[1] = 0; g_ai_prevt = 0;
         logf_("ai: body %s follows %s (spawned once there is a target)", arch, src);
         return 1;
@@ -1584,6 +1647,7 @@ static int ai_cmd(const char *ln)
     if (sscanf(ln, "aispeed %d", &n) == 1) { g_ai_speed = n; logf_("ai: speed %d", n); if (g_ai_src) ai_order("speed"); return 1; }
     if (sscanf(ln, "aitp %f", &r) == 1) { g_ai_tp = r; logf_("ai: teleport distance %.1f", r); return 1; }
     if (sscanf(ln, "ailead %f", &r) == 1) { g_ai_lead = r; logf_("ai: marker leads by %.2f s", r); return 1; }
+    if (sscanf(ln, "airescue %f", &r) == 1) { g_ai_rescue_ms = (DWORD)(r * 1000); logf_("ai: our body waits at most %.0f s for a rescue to end (0 = ignore rescues)", r); return 1; }
     if (sscanf(ln, "aiglide %f %f", &r, &v) == 2) { g_ai_glide_on = r; g_ai_glide_off = v; logf_("ai: glide above %.1f m/s, walk below %.1f m/s", r, v); return 1; }
     if (sscanf(ln, "aistall %d %f", &n, &r) == 2) { g_ai_stall_ms = (DWORD)n; g_ai_stall_m = r; logf_("ai: re-order after %d ms standing, beyond %.1f m", n, r); return 1; }
     if (strncmp(ln, "aistop", 6) == 0) { ai_stop(); return 1; }
@@ -1687,7 +1751,9 @@ static void net_tick(void)
         char out[32];
         unsigned long long v;
         g_net_lastveh = now;
-        lua_eval("local v = CVehicle_GetCurrentVehicle(GetLocalPlayerId()) if v then __out = tostring(v:GetEntity()) else __out = '0' end", out, sizeof out);
+        /* during a reload there is no player, and CVehicle_GetCurrentVehicle then crashes (Dunia+0xe7337) */
+        lua_eval("local p = GetLocalPlayerId() __out = '0' if IsEntityValid(p) == 1 and IsEntityLoaded(p) == 1 then "
+                 "local v = CVehicle_GetCurrentVehicle(p) if v then __out = tostring(v:GetEntity()) end end", out, sizeof out);
         v = strtoull(out, NULL, 10);
         if (v == 0xFFFFFFFFFFFFFFFFull) v = 0;
         if (v != g_net_veh) logf_("net: local player %s vehicle %llu", v ? "entered" : "left", v ? v : g_net_veh);

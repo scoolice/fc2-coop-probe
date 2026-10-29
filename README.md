@@ -87,6 +87,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `aifollow <pawn> remote\|local\|circle [<r> <v>]` | Make an AI pawn follow the peer (`remote`), the local player (`local`, needs `findbody` first) or a test circle of radius `r` at `v` m/s (see [AI body](#ai-body-an-animated-peer)); with `remote` the puppet avatar is not spawned |
 | `aistall <ms> <m>` / `ailead <s>` / `aispeed <n>` / `aitp <m>` | Follower tuning: re-order a pawn that stood `ms` while more than `m` away (default 6000 / 3); lead the marker by `s` s of the target's velocity (default 0); MoveTo speed value (default 3); teleport distance (default 10) |
 | `aiglide <on> <off>` | Above `on` m/s of target speed (a vehicle; default 8) the pawn stops walking and is teleported onto the marker every frame, the marker extrapolated from the last packet by up to 0.25 s; below `off` m/s (default 5) it walks again. `aiglide 0 0` turns it off. A two-copy run with A moving at 10 m/s: glide on 0.5 s after the start, buddy 0.00-0.31 m from A, walking again 0.3 s after the stop |
+| `airescue <seconds>` | The longest the buddy stays away while the game's rescue buddy revives the local player (default 180; 0 = ignore rescues). See "Buddy rescue" |
 | `vinfo <id>` / `vphys <id> 0\|1` / `vset <id> <x> <y> <z> <yaw>` | Log an entity's physics components; switch its physics off or on; place it with `CEntity::SetEuler` / `SetPosition` (yaw in radians). The way FC2JackalFix's noclip moves the player, and safe on vehicles, where `TeleportEntity` crashes (Dunia+0x9fcf02) |
 | `winfo <pawn>` / `wadd <pawn> <weapon>` / `wsel <pawn> primary\|secondary\|hand_hand\|special` / `wdraw <pawn>` / `wholster <pawn>` | Weapons on any pawn: log its weapon manager (mode, state, weapon in hand); give it a spawned weapon entity; select a category (also draws); draw; holster |
 | `sig <pawn> <name\|0xhash>` | Send a signal (crc32 of its name) to the pawn's state driver, as the player's input does (`config/inputactionmapcommon.xml`: `startshooting`, `reload`, `jump`, ...). On an AI pawn `startshooting` does nothing |
@@ -315,6 +316,24 @@ The bullets damage enemies: an enemy soldier 6 m away, kept on the spot with a `
 (`hold` does not keep a pawn in place), took damage from 5 `wfire` shots. The shots make no sound
 and the buddy's arms do not follow the aim. `LookAtTarget` turns him but leaves
 the barrel pointing at the ground, so it is not used.
+
+### Buddy rescue
+
+When the local player goes down and the game has a rescue buddy, it spawns him
+(`GetBuddiesManager():GetRescueBuddyEntityId()`), he revives the player and fights until he has killed an
+enemy. The probe leaves him alone during all of that (moving or teleporting him mid-rescue made his
+model vanish) and removes its own buddy at once, so there are never two. When he has reached the player
+and then stayed more than 8 m away for 5 seconds, or after `airescue` seconds (default 180), or when the
+game removes him, the probe spawns its buddy where he stands and removes him (`RemoveEntity`;
+`RemoveBuddyFromWorld` leaves him there). The game's rescue buddy ignores `MoveTo` afterwards, so he
+cannot be the peer's buddy himself.
+
+Two copies, B's player shot down with Frank set as the rescue buddy: Frank revived B's player, fought,
+and was swapped for the peer's buddy 59 s later, only once the fight was over. The game then offers no
+rescue for a while, so going down again soon is a real death.
+
+The probe asks the engine once a second which vehicle the player is in; it now only does so while the
+player exists, since during a reload `CVehicle_GetCurrentVehicle` crashed the game (Dunia+0xe7337).
 
 ## Automated two-copy test
 
