@@ -11,7 +11,11 @@ Does not touch the real install, the real profile or the real saves.
        0xE0E094  \Far Cry 2           -> \FC2test_B            (own profile + opened save: Documents\My Games\FC2test_B)
      then checks that exactly those 17 bytes changed
   4. puts the probe (-Probe, default dinput8.dll next to this script) into the copy's bin folder; if a
-     SHA256SUMS.txt lies next to this script, the probe must match it
+     SHA256SUMS.txt lies next to this script, the probe must match it. With FC2JackalFix (-JackalFix, default the
+     jackalfix folder get-jackalfix.ps1 makes, used when it exists) the ASI loader becomes bin\dinput8.dll, the probe
+     bin\coop_probe.asi, and a new bin\plugins\FC2JackalFix.ini gets DisplayMode -DisplayMode (2 borderless,
+     3 windowed), Invincibility 1 (JackalFix rewrites god mode every frame, which would undo -TestSettings),
+     LargeAddressAware 0 (never rewrites FarCry2.exe), SkipIntro 0 and SkipTitleScreen 0 (start-coop's Enter presses)
   5. creates Documents\My Games\FC2test_<letter> with GamerProfile.xml and Saved Games\<save>.sav from -PrivateDir
      (a GamerProfile.xml and the one .sav both PCs load; keep these private)
 
@@ -20,12 +24,17 @@ Does not touch the real install, the real profile or the real saves.
 param(
     [Parameter(Mandatory = $true)][string]$PrivateDir,
     [ValidateSet('A', 'B')][string]$Letter = 'B',
-    [string]$Probe = (Join-Path $PSScriptRoot 'dinput8.dll'),
+    [string]$Probe,
     [string]$GameDir,
     [string]$TestDir,
+    [string]$JackalFix,
+    [ValidateSet(2, 3)][int]$DisplayMode = 2,
     [string]$Documents = [Environment]::GetFolderPath('MyDocuments')
 )
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty in the defaults of a script with [Parameter()] attributes
+if (-not $Probe) { $Probe = Join-Path $PSScriptRoot 'dinput8.dll' }
+if (-not $JackalFix) { $JackalFix = Join-Path $PSScriptRoot 'jackalfix' }
 $wantDunia = '6353936a54aa841350bb30ff005727859cdef1aa10c209209b220b399e862765'
 $name = "FC2test_$Letter"
 function Say($m) { Write-Output ("[setup] " + $m) }
@@ -106,8 +115,28 @@ else {
 }
 
 # 4. probe
-Copy-Item $Probe (Join-Path $bin 'dinput8.dll') -Force
-Say 'probe dinput8.dll installed in the test copy'
+if (Test-Path (Join-Path $JackalFix 'bin\plugins\FC2JackalFix.asi')) {
+    Copy-Item $Probe (Join-Path $bin 'coop_probe.asi') -Force
+    Copy-Item (Join-Path $JackalFix 'bin\dinput8.dll') (Join-Path $bin 'dinput8.dll') -Force
+    $plugins = Join-Path $bin 'plugins'
+    New-Item -ItemType Directory -Force $plugins | Out-Null
+    Copy-Item (Join-Path $JackalFix 'bin\plugins\FC2JackalFix.asi') $plugins -Force
+    $ini = Join-Path $plugins 'FC2JackalFix.ini'
+    if (Test-Path $ini) { Say 'FC2JackalFix.ini already in the test copy, kept as it is' }
+    else {
+        $s = [IO.File]::ReadAllText((Join-Path $JackalFix 'bin\plugins\FC2JackalFix.ini'))
+        $s = $s -replace '(?m)^DisplayMode = \d', "DisplayMode = $DisplayMode" -replace '(?m)^LargeAddressAware = 1', 'LargeAddressAware = 0' `
+            -replace '(?m)^SkipIntro = 1', 'SkipIntro = 0' -replace '(?m)^SkipTitleScreen = 1', 'SkipTitleScreen = 0' `
+            -replace '(?m)^\[Debug\]', "[Debug]`nInvincibility = 1               // co-op test: keeps god mode on"
+        [IO.File]::WriteAllText($ini, $s)
+        Say "FC2JackalFix.ini written (DisplayMode $DisplayMode, Invincibility 1)"
+    }
+    Say 'FC2JackalFix installed (ASI loader as dinput8.dll, probe as coop_probe.asi)'
+}
+else {
+    Copy-Item $Probe (Join-Path $bin 'dinput8.dll') -Force
+    Say 'probe dinput8.dll installed in the test copy'
+}
 
 # 5. test profile
 $pdir = Join-Path $Documents "My Games\$name"
