@@ -394,6 +394,7 @@ static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
 
 static BYTE *entity_obj(unsigned long long id, void **holder_out);
 static int ai_cmd(const char *ln);
+static int veh_cmd(const char *ln);
 /* exclude: a body to skip (the local player's when binding the avatar: both stand on the same spot
  * after loading the same save, so the nearest body would otherwise be the player's own) */
 static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, const BYTE *exclude)
@@ -665,7 +666,7 @@ static void native_cmd(const char *ln)
     } else if (sscanf(ln, "poke %lx %lx", &a, &pv) == 2) {
         if (IsBadWritePtr((void *)a, 4)) logf_("poke %lx: not writable", a);
         else { *(unsigned long *)a = pv; logf_("poke %lx = %08lx", a, pv); }
-    } else if (!ai_cmd(ln)) logf_("native: unknown command: %s", ln);
+    } else if (!ai_cmd(ln) && !veh_cmd(ln)) logf_("native: unknown command: %s", ln);
 }
 
 static void run_native(void)
@@ -695,6 +696,69 @@ static BYTE *entity_obj(unsigned long long id, void **holder_out)
     return *(BYTE **)((BYTE *)holder + 0xC);
 }
 
+/* ---- moving an entity the way FC2JackalFix's noclip does (https://github.com/TGP482/FC2JackalFix, MIT) ----
+ * TeleportEntity queues a remove/move/re-add chain built for pawns; on a vehicle its first step reads a null
+ * holder (Dunia+0x9fcf02). Noclip instead switches the physics component off (vtable +0xB4) and calls
+ * CEntity::SetEuler / SetPosition. RVAs resolved from its patterns on the Steam 1.03 build. */
+#define RVA_SETPOSITION   0x4e01b0
+#define RVA_SETEULER      0x4e01c0
+#define RVA_GETCOMPONENT  0x4e2cc0
+#define RVA_PHYSTAG_REG   0x0415d0
+#define RVA_PHYSTAG_FLAG  0xfde930
+#define RVA_PHYSTAG       0xfde940
+#define RVA_GETVEHPHYS    0x0649f0
+typedef void (__attribute__((thiscall)) *setvec_t)(void *ent, float a, float b, float c);
+typedef void *(__attribute__((thiscall)) *getcomp_t)(void *ent, void *tag);
+typedef void *(__attribute__((thiscall)) *getvehphys_t)(void *ent);
+typedef void (__attribute__((thiscall)) *setphys_t)(void *phys, int on);
+typedef void (__attribute__((fastcall)) *reg_t)(void *unused);
+
+static void *ent_physics(BYTE *ent)
+{
+    if (*(int *)(g_base + RVA_PHYSTAG_FLAG) == 0) ((reg_t)(g_base + RVA_PHYSTAG_REG))(NULL);
+    return ((getcomp_t)(g_base + RVA_GETCOMPONENT))(ent, g_base + RVA_PHYSTAG);
+}
+
+static void ent_set_physics(void *phys, int on)
+{
+    ((setphys_t)(*(void ***)phys)[0xB4 / 4])(phys, on);
+}
+
+static void ent_place(BYTE *ent, const float *pos, float yaw)
+{
+    ((setvec_t)(g_base + RVA_SETEULER))(ent, 0.0f, 0.0f, yaw);
+    ((setvec_t)(g_base + RVA_SETPOSITION))(ent, pos[0], pos[1], pos[2]);
+}
+
+/* vinfo <id> | vphys <id> 0|1 | vset <id> <x> <y> <z> <yaw radians> */
+static int veh_cmd(const char *ln)
+{
+    unsigned long long id;
+    void *holder = NULL;
+    BYTE *ent;
+    float v[4];
+    int on;
+    if (sscanf(ln, "vinfo %llu", &id) != 1 && sscanf(ln, "vphys %llu %d", &id, &on) != 2 &&
+        sscanf(ln, "vset %llu %f %f %f %f", &id, &v[0], &v[1], &v[2], &v[3]) != 5) return 0;
+    ent = entity_obj(id, &holder);
+    if (!ent || IsBadReadPtr(ent, 0x70)) logf_("veh %llu: no entity", id);
+    else if (strncmp(ln, "vinfo", 5) == 0) {
+        float *m = (float *)(ent + 0x30);
+        logf_("vinfo %llu: entity %p vtable %p physics %p vehicle physics %p pos %.3f %.3f %.3f fwd %.3f %.3f",
+              id, ent, *(void **)ent, ent_physics(ent), ((getvehphys_t)(g_base + RVA_GETVEHPHYS))(ent), m[12], m[13], m[14], m[4], m[5]);
+    } else if (strncmp(ln, "vphys", 5) == 0) {
+        void *phys = ent_physics(ent);
+        if (!phys) logf_("vphys %llu: no physics component", id);
+        else { ent_set_physics(phys, on); logf_("vphys %llu: physics %p %s", id, phys, on ? "on" : "off"); }
+    } else {
+        ent_place(ent, v, v[3]);
+        logf_("vset %llu: placed at %.3f %.3f %.3f yaw %.3f, now %.3f %.3f %.3f", id, v[0], v[1], v[2], v[3],
+              *(float *)(ent + 0x60), *(float *)(ent + 0x64), *(float *)(ent + 0x68));
+    }
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    return 1;
+}
+
 static void hold_tick(void)
 {
     void *holder = NULL;
@@ -713,14 +777,18 @@ static void hold_tick(void)
 
 /* ---- own UDP transport: position exchange between two copies ---- */
 #pragma pack(push, 1)
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; } NetPkt;
+/* veh: the vehicle the sender is in (0 on foot), with its position and forward vector */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x43324346u
+#define NET_MAGIC 0x32324346u
 static SOCKET g_ns = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static DWORD g_net_lastsend, g_net_lastlog, g_net_lastfind, g_net_lastrx;
 static unsigned g_net_seq, g_net_tx, g_net_rx, g_net_drop;
 static NetPkt g_remote;
+/* the local player's vehicle, asked from the engine once a second (0 on foot) */
+static unsigned long long g_net_veh;
+static DWORD g_net_lastveh;
 static unsigned long long g_av_id;
 static BYTE *g_av_body, *g_av_mat;
 static void av_init_ptr(void) { g_av_body_p = &g_av_body; }
@@ -837,6 +905,23 @@ static char g_ai_arch[96];
 static DWORD g_ai_lastspawn, g_ai_lastvalid;
 static int g_ai_lost;
 static unsigned g_ai_spawns, g_ai_stuck;
+/* the peer's vehicle: our copy of it (both load the same save, so it has the same id) with its physics off,
+ * placed from the packets every frame, our pawn seated in it; g_ai_noveh is one this world does not have */
+static unsigned long long g_ai_veh, g_ai_noveh;
+static int g_ai_seated, g_ai_seattries;
+static DWORD g_ai_lastseat;
+
+static void ai_vehicle_release(void)
+{
+    void *holder = NULL, *phys;
+    BYTE *v;
+    if (!g_ai_veh) return;
+    v = entity_obj(g_ai_veh, &holder);
+    if (v && (phys = ent_physics(v))) ent_set_physics(phys, 1);
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    logf_("ai: released vehicle %llu (physics on)", g_ai_veh);
+    g_ai_veh = 0; g_ai_seated = 0;
+}
 
 static int ent_pos(unsigned long long id, float *out)
 {
@@ -881,6 +966,7 @@ static void remove_entity(unsigned long long id)
 static void ai_stop(void)
 {
     char code[192], out[32];
+    ai_vehicle_release();
     if (g_ai_id) {
         snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
         lua_eval(code, out, sizeof out);
@@ -906,6 +992,7 @@ static void ai_spawn(const float *t, const char *why)
     snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_SetInvincible') __out = 'ok'", g_ai_id);
     lua_eval(code, out, sizeof out);
     g_ai_spawns++; g_ai_stuck = 0;
+    g_ai_seated = 0; g_ai_seattries = 0;
     memcpy(g_ai_last, t, 12); g_ai_lastmove = GetTickCount();
     logf_("ai: body spawned %llu (%s, %s), marker %llu, invincible %s, spawns %u", g_ai_id, g_ai_arch, why, g_ai_marker, out, g_ai_spawns);
     ai_order("spawn");
@@ -920,6 +1007,58 @@ static int ai_target(DWORD now, float *t)
         t[0] = g_ai_c[0] + g_ai_r * (cosf(ang) - 1.0f); t[1] = g_ai_c[1] + g_ai_r * sinf(ang); t[2] = g_ai_c[2];
         return 1;
     }
+}
+
+/* the peer drives g_remote.veh. 0 when this world has no such vehicle (walk or glide instead) */
+static int ai_drive(DWORD now, const float *t, const float *p)
+{
+    void *holder = NULL, *phys;
+    BYTE *v;
+    float pos[3], lead, yaw, d;
+    char code[512], out[32];
+    if (g_ai_veh != g_remote.veh) {
+        ai_vehicle_release();
+        v = entity_obj(g_remote.veh, &holder);
+        phys = v && !IsBadReadPtr(v, 0x70) ? ent_physics(v) : NULL;
+        if (phys) ent_set_physics(phys, 0);
+        if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
+        if (!phys) { logf_("ai: peer's vehicle %llu is not in this world, walking instead", g_remote.veh); g_ai_noveh = g_remote.veh; return 0; }
+        g_ai_veh = g_remote.veh; g_ai_seated = 0; g_ai_seattries = 0; g_ai_lastseat = 0;
+        snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
+        lua_eval(code, out, sizeof out);
+        logf_("ai: peer entered vehicle %llu, physics off", g_ai_veh);
+    }
+    v = entity_obj(g_ai_veh, &holder);
+    if (!v || IsBadReadPtr(v, 0x70)) {
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        logf_("ai: vehicle %llu gone", g_ai_veh);
+        g_ai_noveh = g_ai_veh; g_ai_veh = 0; g_ai_seated = 0;
+        return 0;
+    }
+    lead = fminf((now - g_net_lastrx) / 1000.0f, 0.25f);
+    pos[0] = g_remote.vpos[0] + g_ai_vel[0] * lead; pos[1] = g_remote.vpos[1] + g_ai_vel[1] * lead; pos[2] = g_remote.vpos[2];
+    /* the forward vector is the matrix's local +Y, hence the quarter turn (as noclip seeds its yaw) */
+    yaw = atan2f(g_remote.vfwd[1], g_remote.vfwd[0]) - 1.5707963f;
+    ent_place(v, pos, yaw);
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    /* seating waits for the pawn to have loaded, as the game's VehicleRide box does */
+    if (!g_ai_seated && now - g_ai_lastseat >= 1000) {
+        g_ai_lastseat = now;
+        snprintf(code, sizeof code,
+                 "local v = CVehicle_GetCurrentVehicle('%llu') if v and tostring(v:GetEntity()) == '%llu' then __out = 'in' "
+                 "elseif IsEntityLoaded('%llu') == 1 then SetupVehicleFollowPath('%llu', '%llu', GetInvalidEntityId()) __out = 'seat' "
+                 "else __out = 'wait' end", g_ai_id, g_ai_veh, g_ai_id, g_ai_veh, g_ai_id);
+        lua_eval(code, out, sizeof out);
+        if (strcmp(out, "in") == 0) { g_ai_seated = 1; logf_("ai: body seated in vehicle %llu", g_ai_veh); }
+        else if (++g_ai_seattries == 6) logf_("ai: body still not seated after 6 tries (%s)", out);
+    }
+    if (now - g_ai_lastlog >= 1000) {
+        g_ai_lastlog = now;
+        d = sqrtf((t[0] - p[0]) * (t[0] - p[0]) + (t[1] - p[1]) * (t[1] - p[1]));
+        logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u glide %u veh %llu seated %d",
+              t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps, g_ai_glides, g_ai_veh, g_ai_seated);
+    }
+    return 1;
 }
 
 static void ai_tick(void)
@@ -953,6 +1092,18 @@ static void ai_tick(void)
             g_ai_vel[1] += ((t[1] - g_ai_prev[1]) / dt - g_ai_vel[1]) * 0.3f;
         }
         memcpy(g_ai_prev, t, 12); g_ai_prevt = now;
+    }
+    if (g_ai_src == AI_REMOTE && g_ai_arch[0]) {
+        /* not a vehicle the local player sits in: both would drive it */
+        if (g_remote.veh && g_remote.veh != g_ai_noveh && g_remote.veh != g_net_veh) {
+            if (ai_drive(now, t, p)) return;
+        } else if (g_ai_veh) {
+            logf_("ai: peer left vehicle %llu", g_ai_veh);
+            ai_vehicle_release();
+            g_ai_lastspawn = now;
+            ai_spawn(t, "peer left the vehicle");
+            return;
+        }
     }
     speed = sqrtf(g_ai_vel[0] * g_ai_vel[0] + g_ai_vel[1] * g_ai_vel[1]);
     if (!g_ai_glide && g_ai_glide_on > 0 && speed > g_ai_glide_on) {
@@ -1024,7 +1175,9 @@ static int ai_cmd(const char *ln)
         if (strcmp(src, "remote") && strcmp(src, "local")) { logf_("ai: aibody follows remote or local"); return 1; }
         strcpy(g_ai_arch, arch);
         g_ai_src = !strcmp(src, "remote") ? AI_REMOTE : AI_LOCAL;
+        ai_vehicle_release();
         g_ai_id = g_ai_marker = 0; g_ai_orders = g_ai_tps = g_ai_spawns = g_ai_glides = 0; g_ai_lastspawn = 0; g_ai_lost = 0; g_ai_glide = 0;
+        g_ai_noveh = 0;
         g_ai_t0 = g_ai_lastlog = GetTickCount(); g_ai_vel[0] = g_ai_vel[1] = 0; g_ai_prevt = 0;
         logf_("ai: body %s follows %s (spawned once there is a target)", arch, src);
         return 1;
@@ -1129,15 +1282,32 @@ static void net_tick(void)
     }
     /* with an AI body following the peer, the puppet avatar is not spawned */
     if (g_ai_src != AI_REMOTE) av_tick(now);
+    if (now - g_net_lastveh >= 1000) {
+        char out[32];
+        unsigned long long v;
+        g_net_lastveh = now;
+        lua_eval("local v = CVehicle_GetCurrentVehicle(GetLocalPlayerId()) if v then __out = tostring(v:GetEntity()) else __out = '0' end", out, sizeof out);
+        v = strtoull(out, NULL, 10);
+        if (v == 0xFFFFFFFFFFFFFFFFull) v = 0;
+        if (v != g_net_veh) logf_("net: local player %s vehicle %llu", v ? "entered" : "left", v ? v : g_net_veh);
+        g_net_veh = v;
+    }
     /* send at 20 Hz */
     if (g_bodymat && now - g_net_lastsend >= 50) {
         NetPkt p;
         void *holder = NULL;
         BYTE *obj = entity_obj(g_net_id, &holder);
         g_net_lastsend = now;
+        memset(&p, 0, sizeof p);
         p.magic = NET_MAGIC; p.seq = ++g_net_seq;
         memcpy(p.pos, g_bodymat + 0x30, sizeof p.pos);
         p.dir[0] = obj ? *(float *)(obj + 0x30) : 0; p.dir[1] = obj ? *(float *)(obj + 0x34) : 0;
+        if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
+        if (g_net_veh && (obj = entity_obj(g_net_veh, &holder)) && !IsBadReadPtr(obj, 0x70)) {
+            p.veh = g_net_veh;
+            memcpy(p.vpos, obj + 0x60, sizeof p.vpos);
+            p.vfwd[0] = *(float *)(obj + 0x40); p.vfwd[1] = *(float *)(obj + 0x44);
+        }
         if (holder) (*(int *)((BYTE *)holder + 8))--;
         sendto(g_ns, (char *)&p, sizeof p, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
         g_net_tx++;

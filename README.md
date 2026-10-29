@@ -87,6 +87,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `aifollow <pawn> remote\|local\|circle [<r> <v>]` | Make an AI pawn follow the peer (`remote`), the local player (`local`, needs `findbody` first) or a test circle of radius `r` at `v` m/s (see [AI body](#ai-body-an-animated-peer)); with `remote` the puppet avatar is not spawned |
 | `aistall <ms> <m>` / `ailead <s>` / `aispeed <n>` / `aitp <m>` | Follower tuning: re-order a pawn that stood `ms` while more than `m` away (default 6000 / 3); lead the marker by `s` s of the target's velocity (default 0); MoveTo speed value (default 3); teleport distance (default 10) |
 | `aiglide <on> <off>` | Above `on` m/s of target speed (a vehicle; default 8) the pawn stops walking and is teleported onto the marker every frame, the marker extrapolated from the last packet by up to 0.25 s; below `off` m/s (default 5) it walks again. `aiglide 0 0` turns it off. A two-copy run with A moving at 10 m/s: glide on 0.5 s after the start, buddy 0.00-0.31 m from A, walking again 0.3 s after the stop |
+| `vinfo <id>` / `vphys <id> 0\|1` / `vset <id> <x> <y> <z> <yaw>` | Log an entity's physics components; switch its physics off or on; place it with `CEntity::SetEuler` / `SetPosition` (yaw in radians). The way FC2JackalFix's noclip moves the player, and safe on vehicles, where `TeleportEntity` crashes (Dunia+0x9fcf02) |
 | `aistop` | Stop the follower and remove its marker |
 
 Helpers in `scripts/`: `fc2-session.ps1` starts one test copy, loads its newest save and leaves it
@@ -248,6 +249,21 @@ ailead 0 / 0.7 / 1.2 on the circles: no measurable difference; aispeed 1 is slow
 
 The person playing saw the buddy walk and run with normal animation. It faces where it walks, not
 where the peer looks.
+
+### Vehicles
+
+Each packet also carries the vehicle the sender sits in (`CVehicle_GetCurrentVehicle`, asked once a
+second), its position and its forward vector. Both copies load the same save, so the receiver has
+that vehicle under the same id. When the peer gets in, the receiver switches physics off on its own
+copy, seats the buddy with `SetupVehicleFollowPath` once `IsEntityLoaded` reports the pawn loaded,
+and places the vehicle from the packets every frame (`SetEuler` / `SetPosition`, extrapolated by up
+to 0.25 s). When the peer gets out, physics goes back on and the buddy is spawned again next to the
+peer. A vehicle the receiver does not have falls back to `aiglide`; one the receiver's own player sits
+in is left alone. Old builds drop the new packets (magic `FC22`), so both sides need this one.
+
+Two copies, the player of A driving the save's Datsun for 25 s: the buddy in B got into the driver's
+seat with its animation 1.0 s after A got in, and B's Datsun stayed a median 0.22 m (max 0.39 m while
+driving) from A's.
 
 ## Automated two-copy test
 
