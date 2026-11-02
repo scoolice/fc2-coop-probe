@@ -27,7 +27,7 @@ param(
     [string]$PlayerId,
     [int]$Seconds = 0,
     [switch]$AiBody,
-    [string]$Buddy = 'buddies.Buddies.Frank_Bilders',
+    [string]$Buddy = 'buddies.Buddies.Frank_Bilders_Unarmed',
     [switch]$TestSettings
 )
 $ErrorActionPreference = 'Stop'

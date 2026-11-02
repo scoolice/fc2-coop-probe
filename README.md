@@ -95,6 +95,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `wfire <pawn> <dx> <dy> <dz>` | Like `wbullet`, along the given direction (test: the buddy's bullets do damage enemies) |
 | `wmute <pawn\|0>` | Test: that pawn's gun does not fire on its own: its weapon manager's fire-one-shot step (Dunia+0x1305f0) and start-shooting step are skipped and any own bullet is dropped (only `wbullet`/`wfire` and the peer's synced shots go out). Logs its AI state changes and the call path of its first 3 own bullets. 0 turns it off |
 | `wmutebit <n>` | Test: never set bit `n` of the muted pawn's AI state mask (-1 = none). Bit 0x32 follows its bursts but holding it does not stop the firing |
+| `coords 1\|0` | A small always-on-top strip over the game window with the local, peer and body positions and the body's distance from the peer |
 | `wbit <n> <0\|1>` | Test: set or clear bit `n` of the muted pawn's AI state mask once (needs `wmute` and a running ShootAtTarget). Bit names: 0x01 DominoActive, 0x32 IsShooting, 0x3d ShootAtTarget |
 | `waim <pawn> <x> <y> <z> [or4 or6 or7]` / `waim 0` | Test: after each update of the pawn, set aim flags in its control block (pawn data + 0x140; default +4\|03 AimAt+LookAt, +6\|04, +7\|01) and the aim point. The pawn then points its gun at its feet: these fields alone do not give an aim pose |
 | `waimat <pawn> <entity>` | Like `waim`, with the entity as the aim target (block +0x18c, +6\|84). Same result: gun at its feet |
@@ -355,16 +356,26 @@ player exists, since during a reload `CVehicle_GetCurrentVehicle` crashed the ga
 
 Each packet also carries a flag that is set while the sender's game-over screen is up (packet magic
 `FC26`). The probe sees that screen come and go by wrapping the enter and exit slots (5 and 6) of the
-game-over state's vtable (`CFCXGRStateGameOver`, Dunia+0xeaace0). When the peer's flag turns on, the
-receiver takes the buddy's invincibility away and calls `KillPawnAgent`, which in single player sends
-the pawn 100000 damage, so he falls. It does not respawn him until the flag turns off again, then spawns
-him at the peer. He falls when the peer's game-over screen appears, not at the moment the peer is hit.
+game-over state's vtable (`CFCXGRStateGameOver`, Dunia+0xeaace0).
 
-`buddies.Buddies.Frank_Bilders` goes down from this; `Frank_Bilders_Unarmed` ignores it, invincible or not, so
-the scripts now spawn `Frank_Bilders`. Two copies on one PC, A's player killed: B's buddy went down 62 ms after
-A's game-over screen, and a new one appeared 31 ms after A left it (build `6a6001a9`, owner watching). Not tried
-over two PCs. A jump of the peer's position above 60 m/s now counts as a teleport, not a speed: a reload's
-position once threw each new buddy so far ahead that the engine dropped him.
+`KillPawnAgent` sends a pawn 100000 damage. `Frank_Bilders_Unarmed`, the buddy the scripts spawn, ignores it,
+invincible or not, while `Frank_Bilders` goes down. So when the peer's flag turns on, the receiver replaces the
+buddy where he stands with the archetype without `_Unarmed` and kills that one once it has loaded, which shows
+as a brief pop. When the flag turns off, it removes him and spawns a new buddy at the peer. He goes down when the
+peer's game-over screen appears, not at the moment the peer is hit.
+
+Two copies on one PC, A's player killed (build `3dac71db`): B replaced the buddy 62 ms after A's game-over
+screen and killed the replacement 0.55 s later. The owner saw the pop, and after A's reload the buddy followed
+as before. Not tried over two PCs.
+
+### Teleports and following
+
+A position jump above 60 m/s counts as a teleport, not a speed: a reload's position once threw each new buddy
+so far ahead that the engine dropped him. A `MoveTo` sent while the pawn runs an older one did not replace it,
+and a teleport did not end it: after a sprint the buddy kept running to an old goal while the peer stood still,
+was teleported back at 10 m, and repeated that until the peer walked on. A teleport or the end of a glide now
+sends `MoveToStopped`, and the new `MoveTo` 200 ms later. Sprinting in A with stops, same build: 1 teleport, 2
+glides, median 0.93 m from A (129 samples); before the change 22 teleports in a similar run.
 
 ## Automated two-copy test
 

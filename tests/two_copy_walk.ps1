@@ -44,7 +44,7 @@ param(
     # instead of the puppet avatar. A chasing AI trails behind, so it gets its own limits; heading is not
     # checked (the buddy faces where it walks)
     [switch]$AiBody,
-    [string]$Buddy = 'buddies.Buddies.Frank_Bilders',
+    [string]$Buddy = 'buddies.Buddies.Frank_Bilders_Unarmed',
     # with -AiBody: after the walk, remove B's buddy (what a death or checkpoint reload does to it) and require
     # the probe to spawn a new one that stands near A
     [switch]$AiRespawn,

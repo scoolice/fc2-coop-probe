@@ -1463,6 +1463,7 @@ static unsigned g_ai_orders, g_ai_tps;
 /* aibody: the pawn is our own, spawned from g_ai_arch and made invincible; when it or the marker is gone (a
  * checkpoint reload or death removes both) or it ignores orders, both are spawned again at the target */
 static char g_ai_arch[96];
+static unsigned long long g_ai_corpse;  /* the pawn standing in for the body while the peer is dead */
 static DWORD g_ai_lastspawn, g_ai_lastvalid;
 static int g_ai_lost;
 static unsigned g_ai_spawns, g_ai_stuck;
@@ -1546,6 +1547,7 @@ static void ai_stop(void)
     }
     remove_entity(g_ai_marker);
     if (g_ai_arch[0]) { remove_entity(g_ai_id); ai_weapons_clear(); }
+    remove_entity(g_ai_corpse); g_ai_corpse = 0;
     logf_("ai: stopped (%u orders, %u teleports, %u spawns)", g_ai_orders, g_ai_tps, g_ai_spawns);
     g_ai_src = AI_OFF; g_ai_id = g_ai_marker = 0; g_ai_arch[0] = 0;
 }
@@ -1770,34 +1772,108 @@ static int ai_rescue(DWORD now)
     return 1;
 }
 
-/* While the peer's game-over screen is up (NET_DEAD), our body goes down too: invincibility off (the event name's typo
- * is the game's), then KillPawnAgent (100000 damage, type 3, flags 0x40; LAB_10723170). Frank_Bilders goes down from
- * this; Frank_Bilders_Unarmed ignores it, invincible or not. The body is not respawned until the flag clears, then
- * it comes back at the peer. */
+/* While the peer's game-over screen is up (NET_DEAD), our body goes down too. KillPawnAgent (100000 damage, type 3,
+ * flags 0x40; LAB_10723170) does nothing to a Frank_Bilders_Unarmed, invincible or not, while a Frank_Bilders goes down;
+ * but only the _Unarmed one (bIsScripted) obeys MoveTo. So the body is replaced where it stands by the archetype without
+ * "_Unarmed", which is killed once loaded. When the flag clears he is removed and the body comes back at the peer. */
 static int g_ai_dead;
+static DWORD g_ai_lastkill;
 
 static int ai_peer_dead(DWORD now, const float *t)
 {
-    char code[256], out[32] = "no body";
+    char code[192], out[32];
     if (g_ai_src != AI_REMOTE || !g_ai_arch[0]) return 0;
     if (g_remote.flags & NET_DEAD) {
-        if (g_ai_dead) return 1;
-        g_ai_dead = 1;
-        ai_vehicle_release();
-        if (g_ai_id && !g_ai_lost) {
-            snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_UnsetInvicible') "
-                     "KillPawnAgent('%llu') __out = 'ok'", g_ai_id, g_ai_id);
-            lua_eval(code, out, sizeof out);
+        if (!g_ai_dead) {
+            char arch[96], *u;
+            float p[3];
+            g_ai_dead = 1; g_ai_lastkill = 0;
+            ai_vehicle_release();
+            if (!g_ai_id || g_ai_lost || !ent_pos(g_ai_id, p)) memcpy(p, t, sizeof p);
+            remove_entity(g_ai_id); ai_weapons_clear();
+            g_ai_id = 0;
+            strcpy(arch, g_ai_arch);
+            if ((u = strstr(arch, "_Unarmed"))) *u = 0;
+            g_ai_corpse = spawn_at(arch, p[0], p[1], p[2] + 0.3f);
+            logf_("ai: peer died (game over); body replaced by %s %llu", arch, g_ai_corpse);
         }
-        logf_("ai: peer died (game over); body %llu killed (%s)", g_ai_id, out);
+        if (g_ai_dead == 1 && g_ai_corpse && now - g_ai_lastkill >= 100) {
+            g_ai_lastkill = now;
+            snprintf(code, sizeof code, "if IsEntityLoaded('%llu') == 1 then KillPawnAgent('%llu') __out = 'down' else __out = 'wait' end", g_ai_corpse, g_ai_corpse);
+            lua_eval(code, out, sizeof out);
+            if (!strcmp(out, "down")) { g_ai_dead = 2; logf_("ai: %llu killed", g_ai_corpse); }
+        }
         return 1;
     }
     if (!g_ai_dead) return 0;
     g_ai_dead = 0;
+    remove_entity(g_ai_corpse); g_ai_corpse = 0;
     g_ai_lastspawn = now;
     g_ai_lost = 1;  /* until ai_spawn succeeds; it waits while the local player is not in the world */
     ai_spawn(t, "peer back after death");
     return 1;
+}
+
+/* coords 1|0: a small always-on-top strip over the game window with the local, peer and body positions. It belongs
+ * to a thread of its own and takes no input. */
+static volatile int g_ov_on;
+static int g_ov_n;
+static char g_ov_text[192];
+
+static BOOL CALLBACK ov_findgame(HWND w, LPARAM out)
+{
+    DWORD pid;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid == GetCurrentProcessId() && IsWindowVisible(w) && !(GetWindowLongA(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) { *(HWND *)out = w; return FALSE; }
+    return TRUE;
+}
+
+static DWORD WINAPI ov_thread(LPVOID p)
+{
+    HWND ov = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+                              "STATIC", "", WS_POPUP | SS_LEFT, 0, 0, 760, 22, NULL, NULL, NULL, NULL);
+    char shown[192] = "";
+    (void)p;
+    if (!ov) { logf_("coords: no window (%lu)", GetLastError()); return 0; }
+    SetLayeredWindowAttributes(ov, 0, 230, LWA_ALPHA);
+    for (;;) {
+        HWND game = NULL;
+        RECT rc;
+        MSG m;
+        while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
+        EnumWindows(ov_findgame, (LPARAM)&game);
+        if (g_ov_on && game && GetWindowRect(game, &rc) && !IsIconic(game)) {
+            if (strcmp(shown, g_ov_text)) { strcpy(shown, g_ov_text); SetWindowTextA(ov, shown); }
+            SetWindowPos(ov, HWND_TOPMOST, rc.left + 8, rc.top + 8, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        } else ShowWindow(ov, SW_HIDE);
+        Sleep(200);
+    }
+}
+
+static void ov_update(void)
+{
+    const float *l = g_bodymat && !IsBadReadPtr(g_bodymat, 0x40) ? (const float *)(g_bodymat + 0x30) : NULL;
+    float b[3] = { 0, 0, 0 };
+    char s[192];
+    int have = g_ai_id && ent_pos(g_ai_id, b);
+    float dx = b[0] - g_remote.pos[0], dy = b[1] - g_remote.pos[1];
+    snprintf(s, sizeof s, " me %.1f %.1f %.1f | peer %.1f %.1f %.1f | body %.1f %.1f %.1f | body-peer %.1f m",
+             l ? l[0] : 0, l ? l[1] : 0, l ? l[2] : 0, g_remote.pos[0], g_remote.pos[1], g_remote.pos[2],
+             b[0], b[1], b[2], have ? sqrtf(dx * dx + dy * dy) : -1.0f);
+    strcpy(g_ov_text, s);
+}
+
+/* A MoveTo sent while the pawn is still running an older one does not replace it, and a teleport does not end it: he
+ * kept running to the old goal, 10 m on he was teleported again, and so on, until the peer walked on. So a teleport
+ * cancels the running order, and the new one follows once the pawn has stopped and its position has updated. */
+static DWORD g_ai_order_at;
+
+static void ai_order_later(DWORD now)
+{
+    char code[160], out[16];
+    snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
+    lua_eval(code, out, sizeof out);
+    g_ai_order_at = now + 200; g_ai_lastorder = now;
 }
 
 static void ai_tick(void)
@@ -1826,6 +1902,7 @@ static void ai_tick(void)
         return;
     }
     if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
+    if (g_ai_order_at && (long)(now - g_ai_order_at) >= 0) { g_ai_order_at = 0; if (!g_ai_glide) ai_order("after teleport"); }
     if (now - g_ai_prevt >= 100) {
         float dt = (now - g_ai_prevt) / 1000.0f;
         if (g_ai_prevt && dt < 1.0f) {
@@ -1858,7 +1935,7 @@ static void ai_tick(void)
     } else if (g_ai_glide && (speed < g_ai_glide_off || g_ai_glide_on <= 0)) {
         g_ai_glide = 0;
         logf_("ai: target at %.1f m/s, walking again", speed);
-        ai_order("glide end");
+        ai_order_later(now);
         memcpy(g_ai_last, p, 12); g_ai_lastmove = now;
     }
     lead = g_ai_lead;
@@ -1891,7 +1968,7 @@ static void ai_tick(void)
         lua_eval(code, out, sizeof out);
         g_ai_tps++;
         logf_("ai: %.1f m behind, teleported", d);
-        ai_order("after teleport");
+        ai_order_later(now);
         memcpy(g_ai_last, t, 12); g_ai_lastmove = now;
         return;
     }
@@ -1932,6 +2009,7 @@ static int ai_cmd(const char *ln)
     if (sscanf(ln, "aispeed %d", &n) == 1) { g_ai_speed = n; logf_("ai: speed %d", n); if (g_ai_src) ai_order("speed"); return 1; }
     if (sscanf(ln, "aitp %f", &r) == 1) { g_ai_tp = r; logf_("ai: teleport distance %.1f", r); return 1; }
     if (sscanf(ln, "ailead %f", &r) == 1) { g_ai_lead = r; logf_("ai: marker leads by %.2f s", r); return 1; }
+    if (sscanf(ln, "coords %d", &g_ov_n) == 1) { static int started; g_ov_on = g_ov_n; if (g_ov_on && !started) { started = 1; CreateThread(NULL, 0, ov_thread, NULL, 0, NULL); } logf_("coords: %s", g_ov_on ? "on" : "off"); return 1; }
     if (sscanf(ln, "airescue %f", &r) == 1) { g_ai_rescue_ms = (DWORD)(r * 1000); logf_("ai: our body waits at most %.0f s for a rescue to end (0 = ignore rescues)", r); return 1; }
     if (sscanf(ln, "aiglide %f %f", &r, &v) == 2) { g_ai_glide_on = r; g_ai_glide_off = v; logf_("ai: glide above %.1f m/s, walk below %.1f m/s", r, v); return 1; }
     if (sscanf(ln, "aistall %d %f", &n, &r) == 2) { g_ai_stall_ms = (DWORD)n; g_ai_stall_m = r; logf_("ai: re-order after %d ms standing, beyond %.1f m", n, r); return 1; }
@@ -2046,6 +2124,7 @@ static void net_tick(void)
         if (v != g_net_veh) logf_("net: local player %s vehicle %llu", v ? "entered" : "left", v ? v : g_net_veh);
         g_net_veh = v;
     }
+    { static DWORD last; if (g_ov_on && now - last >= 200) { last = now; ov_update(); } }
     /* send at 20 Hz */
     if (g_bodymat && now - g_net_lastsend >= 50) {
         NetPkt p;
