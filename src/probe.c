@@ -1057,6 +1057,16 @@ static void __attribute__((thiscall)) h_startshoot(void *strat, void *pc)
 typedef void (__attribute__((fastcall)) *aifire_t)(void *task);
 static aifire_t o_aifire;
 static void *g_mute_agent;  /* the muted pawn's AI agent, as its shoot task last showed it */
+static BYTE *g_mute_task;  /* its running shoot task; a new pointer means the behaviour started another one */
+static int g_aim_stop;  /* waimto: end the next shoot task after its first aim step */
+
+/* the shoot task's own way out: FUN_10979990 ends the burst, and with +0x91 set its update (FUN_1097b920) sets the
+ * finished status and returns 1. The pawn keeps its aim pose. */
+static void shoot_task_end(BYTE *k)
+{
+    ((void (__attribute__((fastcall)) *)(void *))(g_base + 0x979990))(k);
+    k[0x91] = 1;
+}
 
 static void __attribute__((fastcall)) h_aifire(void *task)
 {
@@ -1065,6 +1075,8 @@ static void __attribute__((fastcall)) h_aifire(void *task)
     o_aifire(task);
     if (g_mute_id && pc && pc_entity_id(pc) == g_mute_id) {
         g_mute_agent = agent;
+        if (g_aim_stop) { g_aim_stop = 0; shoot_task_end(task); g_mute_task = NULL; logf_("waimto: task %p ended", task); return; }
+        if (g_mute_task != (BYTE *)task) { logf_("shot: shoot task of %llu is %p", g_mute_id, task); g_mute_task = task; }
         *(*(BYTE **)(pc + 0x10) + 0x140 + 6) &= ~4;
         if (n++ % 200 == 0) logf_("shot: held %u fire input(s) of %llu", n, g_mute_id);
     }
@@ -1229,6 +1241,29 @@ static int wpn_cmd(const char *ln)
     }
     else if (sscanf(ln, "sig %llu %47s", &id, cat) == 2) op = 5;
     else if (sscanf(ln, "wmutebit %i", &op) == 1) { g_mute_bit = op; logf_("wmutebit: agent bit 0x%x held", op); return 1; }
+    else if (sscanf(ln, "waimto %llu %llu %f %f %f", &id, &wid, &fd[0], &fd[1], &fd[2]) == 5) {
+        /* <pawn> <marker> <x y z>: aim the pawn (wmute'd) at that point without firing */
+        char code[192], out[16];
+        BYTE *mk = entity_obj(wid, &holder);
+        if (!mk || IsBadWritePtr(mk + 0x60, 12)) logf_("waimto: no marker %llu", wid);
+        else {
+            memcpy(mk + 0x60, fd, 12);
+            g_aim_stop = 1;
+            snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'ShootAtTarget', '%llu') __out = 'ok'", id, wid);
+            lua_eval(code, out, sizeof out);
+            logf_("waimto: %llu at %.1f %.1f %.1f (%s)", id, fd[0], fd[1], fd[2], out);
+        }
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        return 1;
+    }
+    else if (strcmp(ln, "wstop") == 0) {
+        BYTE *k = g_mute_task;
+        if (!k) { logf_("wstop: no muted shoot task"); return 1; }
+        logf_("wstop: task %p status %08x length %d burst %d/%d/%d flags %02x", k, *(unsigned *)(k + 0x18), *(int *)(k + 0x44), k[0x90], k[0x91], k[0x92], k[0xa0]);
+        shoot_task_end(k);
+        g_mute_task = NULL;
+        return 1;
+    }
     else if (sscanf(ln, "wbit %i %i", &op, &on) == 2) {
         /* bit names: the FlagFieldValue table next to the "ShootAtTarget" string (0x01 DominoActive, 0x32 IsShooting, 0x3d ShootAtTarget) */
         if (!g_mute_agent || !o_agentbit) { logf_("wbit: no muted agent yet (wmute, then ShootAtTarget)"); return 1; }
