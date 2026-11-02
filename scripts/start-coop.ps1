@@ -1,4 +1,4 @@
-﻿<#
+<#
 Starts one side of a two-PC Far Cry 2 co-op probe session over Steam.
 
   host (PC A):  powershell -ExecutionPolicy Bypass -File scripts\start-coop.ps1 -Role host -TestDir <test copy> -SteamDll <steam_api64.dll>
@@ -27,7 +27,7 @@ param(
     [string]$PlayerId,
     [int]$Seconds = 0,
     [switch]$AiBody,
-    [string]$Buddy = 'buddies.Buddies.Frank_Bilders_Unarmed',
+    [string]$Buddy = 'buddies.Buddies.Frank_Bilders',
     [switch]$TestSettings
 )
 $ErrorActionPreference = 'Stop'

@@ -44,7 +44,7 @@ param(
     # instead of the puppet avatar. A chasing AI trails behind, so it gets its own limits; heading is not
     # checked (the buddy faces where it walks)
     [switch]$AiBody,
-    [string]$Buddy = 'buddies.Buddies.Frank_Bilders_Unarmed',
+    [string]$Buddy = 'buddies.Buddies.Frank_Bilders',
     # with -AiBody: after the walk, remove B's buddy (what a death or checkpoint reload does to it) and require
     # the probe to spawn a new one that stands near A
     [switch]$AiRespawn,
@@ -165,6 +165,9 @@ function Native($k, $text) {
     Set-Content $c.nat $text -Encoding ascii
     WaitFor "native consumed ($k)" 10 { -not (Test-Path $c.nat) } | Out-Null
 }
+
+# last match of $re in copy $k's log, or $null (a dead or reloading player prints no pos line)
+function LastMatch($k, $re) { $m = LogLines $copies[$k] | Select-String $re | Select-Object -Last 1; if ($m) { $m.Matches[0] } }
 
 function Tick($line) { if ($line -match '^\[\s*(\d+) ') { [long]$Matches[1] } else { 0 } }
 function Vec($s) { $v = $s -split '\s+' | Where-Object { $_ } | ForEach-Object { [double]$_ }; ,$v }
@@ -320,12 +323,14 @@ try {
     # ---- optional: move B's player off A's circle (tpb moves B's cached local body) ----
     if ($MoveBAside -gt 0) {
         Native B "pos $pid0"
-        $p = (LogLines $copies.B | Select-String "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)" | Select-Object -Last 1).Matches[0]
+        $p = LastMatch B "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)"
+        if (-not $p) { throw "no pos line for B's player before moving it aside (dead or reloading?)" }
         $to = @(([double]$p.Groups[1].Value + $MoveBAside), [double]$p.Groups[2].Value, ([double]$p.Groups[3].Value + 0.5))
         Native B ([string]::Format([Globalization.CultureInfo]::InvariantCulture, 'tpb {0} {1} {2}', $to[0], $to[1], $to[2]))
         Start-Sleep 3
         Native B "pos $pid0"
-        $q = (LogLines $copies.B | Select-String "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)" | Select-Object -Last 1).Matches[0]
+        $q = LastMatch B "pos ${pid0}: x=(\S+) y=(\S+) z=(\S+)"
+        if (-not $q) { throw "no pos line for B's player after moving it aside (dead or reloading?)" }
         $moved = Dist2D @([double]$q.Groups[1].Value, [double]$q.Groups[2].Value) @([double]$p.Groups[1].Value, [double]$p.Groups[2].Value)
         Check 'B moved aside' ($moved -ge $MoveBAside - 1) ("B player moved {0:N2} m (asked {1}), now z={2}" -f $moved, $MoveBAside, $q.Groups[3].Value)
     }
@@ -389,10 +394,10 @@ try {
         Check 'buddy respawned B' ($sp.Matches[0].Groups[2].Value -eq 'ok') ("{0:N1} s after removal: {1}" -f ((Get-Date) - $t0).TotalSeconds, ($sp.Line -replace '^\S+ \S+ ', ''))
         Start-Sleep 5
         Native B "pos $avB"
-        $pb = (LogLines $copies.B | Select-String "pos ${avB}: x=(\S+) y=(\S+)" | Select-Object -Last 1).Matches[0]
-        $ra = (LogLines $copies.B | Select-String 'net: .* remote=\((\S+) (\S+) (\S+)\)' | Select-Object -Last 1).Matches[0]
-        $dr = Dist2D @([double]$pb.Groups[1].Value, [double]$pb.Groups[2].Value) @([double]$ra.Groups[1].Value, [double]$ra.Groups[2].Value)
-        Check 'respawned buddy near A' ($dr -le 5) ("{0:N2} m from A's position 5 s after the respawn (limit 5)" -f $dr)
+        $pb = LastMatch B "pos ${avB}: x=(\S+) y=(\S+)"
+        $ra = LastMatch B 'net: .* remote=\((\S+) (\S+) (\S+)\)'
+        $dr = if ($pb -and $ra) { Dist2D @([double]$pb.Groups[1].Value, [double]$pb.Groups[2].Value) @([double]$ra.Groups[1].Value, [double]$ra.Groups[2].Value) } else { 999 }
+        Check 'respawned buddy near A' ($dr -le 5) ("{0:N2} m from A's position 5 s after the respawn (limit 5; 999 = no pos line)" -f $dr)
 
         # a real death: B's player is killed (god mode off), Enter on the death screen reloads the last save,
         # which removes the buddy and the marker; the probe must spawn them again in the reloaded world
@@ -423,8 +428,12 @@ try {
     foreach ($dx in $(if ($AiBody) { @() } else { 600, -1200, 900 })) {
         Guard; MouseX A $dx; Start-Sleep 3
         Native A "pos $pid0"; Native B "pos $avB"
-        $la = (LogLines $copies.A | Select-String "pos ${pid0}: .* dir=\((\S+),(\S+)\)" | Select-Object -Last 1).Matches[0]
-        $lb = (LogLines $copies.B | Select-String "pos ${avB}: .* dir=\((\S+),(\S+)\)" | Select-Object -Last 1).Matches[0]
+        $la = LastMatch A "pos ${pid0}: .* dir=\((\S+),(\S+)\)"
+        $lb = LastMatch B "pos ${avB}: .* dir=\((\S+),(\S+)\)"
+        if (-not $la -or -not $lb) {
+            Check 'heading readable' $false ("no pos line for {0} after the mouse turn (dead or reloading?)" -f $(if (-not $la) { "A's player" } else { "B's avatar" }))
+            break
+        }
         $aa = [math]::Atan2([double]$la.Groups[2].Value, [double]$la.Groups[1].Value) * 180 / [math]::PI
         $ab = [math]::Atan2([double]$lb.Groups[2].Value, [double]$lb.Groups[1].Value) * 180 / [math]::PI
         $d = [math]::Abs((($aa - $ab) % 360 + 540) % 360 - 180)
@@ -434,7 +443,7 @@ try {
     if (-not $AiBody) {
         $turned = ($angles | Measure-Object -Max -Min | ForEach-Object { $_.Maximum - $_.Minimum })
         Check 'A turned' ($turned -ge 30) ("A's heading range {0:N1} deg over 3 turns (needs >= 30)" -f $turned)
-        Check 'avatar heading follows A' (($diffs | Measure-Object -Max).Maximum -le 15) ("max difference {0:N1} deg (limit 15)" -f ($diffs | Measure-Object -Max).Maximum)
+        Check 'avatar heading follows A' ($diffs.Count -eq 3 -and ($diffs | Measure-Object -Max).Maximum -le 15) ("max difference {0:N1} deg (limit 15)" -f ($diffs | Measure-Object -Max).Maximum)
     }
 
     if ($Relay) {

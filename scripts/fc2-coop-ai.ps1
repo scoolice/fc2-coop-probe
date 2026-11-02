@@ -10,8 +10,8 @@ param(
     [Parameter(Mandatory = $true)][string]$CopyA,
     [Parameter(Mandatory = $true)][string]$CopyB,
     [string]$Probe,
-    [string]$BuddyA = 'buddies.Buddies.Frank_Bilders_Unarmed',   # shown in A for B's player
-    [string]$BuddyB = 'buddies.Buddies.Frank_Bilders_Unarmed',   # shown in B for A's player
+    [string]$BuddyA = 'buddies.Buddies.Frank_Bilders',   # shown in A for B's player
+    [string]$BuddyB = 'buddies.Buddies.Frank_Bilders',   # shown in B for A's player
     [switch]$NoTestSettings
 )
 $ErrorActionPreference = 'Stop'

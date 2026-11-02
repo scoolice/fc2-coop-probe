@@ -1135,6 +1135,40 @@ static void __attribute__((thiscall)) h_pawnupd(void *pd, void *a, void *b)
     }
 }
 
+/* The game-rules state CFCXGRStateGameOver (vtable 0x10eaace0) runs while the game-over screen is up: slot 5
+ * (FUN_107f6a60, enter) and slot 6 (FUN_107f6ad0, exit), both thiscall (state, arg), RET 4. Their vtable entries
+ * are swapped for wrappers that keep g_gameover, which the packets carry so the peer's body can die with us. */
+#define RVA_GAMEOVER_VT 0xeaace0
+typedef void (__attribute__((thiscall)) *gostate_t)(void *self, void *arg);
+static gostate_t o_go_enter, o_go_exit;
+static volatile int g_gameover;
+
+static void __attribute__((thiscall)) h_go_enter(void *self, void *arg)
+{
+    g_gameover = 1;
+    logf_("game over: entered");
+    o_go_enter(self, arg);
+}
+
+static void __attribute__((thiscall)) h_go_exit(void *self, void *arg)
+{
+    g_gameover = 0;
+    logf_("game over: left");
+    o_go_exit(self, arg);
+}
+
+static void install_gameover_hook(void)
+{
+    void **vt = (void **)(g_base + RVA_GAMEOVER_VT);
+    DWORD old;
+    if (vt[5] != g_base + 0x7f6a60 || vt[6] != g_base + 0x7f6ad0) { logf_("game over hook: unexpected vtable at Dunia+0x%x, not installed", RVA_GAMEOVER_VT); return; }
+    o_go_enter = (gostate_t)vt[5]; o_go_exit = (gostate_t)vt[6];
+    VirtualProtect(vt + 5, 2 * sizeof(void *), PAGE_READWRITE, &old);
+    vt[5] = (void *)h_go_enter; vt[6] = (void *)h_go_exit;
+    VirtualProtect(vt + 5, 2 * sizeof(void *), old, &old);
+    logf_("game over hook installed (Dunia+0x%x slots 5, 6)", RVA_GAMEOVER_VT);
+}
+
 static void install_shot_hook(void)
 {
     static const BYTE sub8c[6] = { 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00 };  /* SUB ESP,0x8c */
@@ -1184,7 +1218,7 @@ static int wpn_cmd(const char *ln)
     char cat[48];
     void *holder = NULL, *pc;
     BYTE *ent, *mgr, *m;
-    int op;
+    int op, on;
     float fd[3];
     if (sscanf(ln, "wfire %llu %f %f %f", &id, &fd[0], &fd[1], &fd[2]) == 4) { op = 7; wid = id; }
     else if (strcmp(ln, "waim 0") == 0) { g_aim_pd = NULL; g_aim_holder = NULL; logf_("waim: off"); return 1; }
@@ -1195,6 +1229,14 @@ static int wpn_cmd(const char *ln)
     }
     else if (sscanf(ln, "sig %llu %47s", &id, cat) == 2) op = 5;
     else if (sscanf(ln, "wmutebit %i", &op) == 1) { g_mute_bit = op; logf_("wmutebit: agent bit 0x%x held", op); return 1; }
+    else if (sscanf(ln, "wbit %i %i", &op, &on) == 2) {
+        /* bit names: the FlagFieldValue table next to the "ShootAtTarget" string (0x01 DominoActive, 0x32 IsShooting, 0x3d ShootAtTarget) */
+        if (!g_mute_agent || !o_agentbit) { logf_("wbit: no muted agent yet (wmute, then ShootAtTarget)"); return 1; }
+        unsigned long long was = *(unsigned long long *)((BYTE *)g_mute_agent + 0x190);
+        o_agentbit(g_mute_agent, op, on);
+        logf_("wbit 0x%x %d: mask %016llx -> %016llx", op, on, was, *(unsigned long long *)((BYTE *)g_mute_agent + 0x190));
+        return 1;
+    }
     else if (sscanf(ln, "wmute %llu", &id) == 1) { g_mute_id = id; g_muted = 0; g_mute_agent = NULL; logf_("wmute: %llu's own bullets %s", id, id ? "dropped" : "(none muted)"); return 1; }
     else if (sscanf(ln, "wbullet %llu %llu", &id, &wid) >= 1) { op = 7; if (sscanf(ln, "wbullet %llu %llu", &id, &wid) < 2) wid = id; }
     else if (sscanf(ln, "winfo %llu", &id) == 1) op = 0;
@@ -1291,10 +1333,11 @@ static void hold_tick(void)
 #pragma pack(push, 1)
 /* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
  * weapon in the sender's hand ("" for none); shots: bullets the sender's guns fired so far; aim: direction of the
- * sender's last bullet */
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; } NetPkt;
+ * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x35324346u
+#define NET_MAGIC 0x36324346u
+#define NET_DEAD 1u
 static SOCKET g_ns = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static DWORD g_net_lastsend, g_net_lastlog, g_net_lastfind, g_net_lastrx;
@@ -1406,6 +1449,7 @@ static float g_ai_stall_m = 3.0f;
 /* the marker leads the target by g_ai_lead seconds of its (smoothed) velocity, so a pawn following a moving
  * target keeps walking instead of arriving, stopping and waiting for the next order */
 static float g_ai_lead, g_ai_vel[2], g_ai_prev[3];
+#define AI_MAX_SPEED 60.0f
 static DWORD g_ai_prevt;
 /* a pawn cannot walk as fast as a vehicle: above g_ai_glide_on m/s of target speed it is teleported onto the marker
  * every frame (the marker extrapolated from the last packet), back to MoveTo below g_ai_glide_off. On foot the
@@ -1519,6 +1563,7 @@ static void ai_spawn(const float *t, const char *why)
     if (g_ai_marker) g_ai_id = spawn_at(g_ai_arch, t[0] + 1.0f, t[1], t[2] + 0.3f);
     if (!g_ai_id) return;
     g_ai_lost = 0; g_ai_lastvalid = GetTickCount();
+    g_ai_vel[0] = g_ai_vel[1] = 0; g_ai_prevt = 0; g_ai_glide = 0;
     snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_SetInvincible') __out = 'ok'", g_ai_id);
     lua_eval(code, out, sizeof out);
     g_ai_spawns++; g_ai_stuck = 0;
@@ -1725,6 +1770,36 @@ static int ai_rescue(DWORD now)
     return 1;
 }
 
+/* While the peer's game-over screen is up (NET_DEAD), our body goes down too: invincibility off (the event name's typo
+ * is the game's), then KillPawnAgent (100000 damage, type 3, flags 0x40; LAB_10723170). Frank_Bilders goes down from
+ * this; Frank_Bilders_Unarmed ignores it, invincible or not. The body is not respawned until the flag clears, then
+ * it comes back at the peer. */
+static int g_ai_dead;
+
+static int ai_peer_dead(DWORD now, const float *t)
+{
+    char code[256], out[32] = "no body";
+    if (g_ai_src != AI_REMOTE || !g_ai_arch[0]) return 0;
+    if (g_remote.flags & NET_DEAD) {
+        if (g_ai_dead) return 1;
+        g_ai_dead = 1;
+        ai_vehicle_release();
+        if (g_ai_id && !g_ai_lost) {
+            snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_UnsetInvicible') "
+                     "KillPawnAgent('%llu') __out = 'ok'", g_ai_id, g_ai_id);
+            lua_eval(code, out, sizeof out);
+        }
+        logf_("ai: peer died (game over); body %llu killed (%s)", g_ai_id, out);
+        return 1;
+    }
+    if (!g_ai_dead) return 0;
+    g_ai_dead = 0;
+    g_ai_lastspawn = now;
+    g_ai_lost = 1;  /* until ai_spawn succeeds; it waits while the local player is not in the world */
+    ai_spawn(t, "peer back after death");
+    return 1;
+}
+
 static void ai_tick(void)
 {
     DWORD now;
@@ -1744,6 +1819,7 @@ static void ai_tick(void)
         if (strcmp(out, "11") != 0 && !g_ai_lost) { logf_("ai: body or marker gone (valid %s)", out); g_ai_lost = 1; }
     }
     if (ai_rescue(now)) return;
+    if (ai_peer_dead(now, t)) return;
     if (g_ai_lost || !g_ai_id || !ent_pos(g_ai_id, p) || !entity_obj(g_ai_marker, &holder)) {
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_ai_arch[0] && now - g_ai_lastspawn > 3000) { g_ai_lastspawn = now; ai_spawn(t, g_ai_spawns ? "lost, respawn" : "first"); }
@@ -1753,8 +1829,11 @@ static void ai_tick(void)
     if (now - g_ai_prevt >= 100) {
         float dt = (now - g_ai_prevt) / 1000.0f;
         if (g_ai_prevt && dt < 1.0f) {
-            g_ai_vel[0] += ((t[0] - g_ai_prev[0]) / dt - g_ai_vel[0]) * 0.3f;
-            g_ai_vel[1] += ((t[1] - g_ai_prev[1]) / dt - g_ai_vel[1]) * 0.3f;
+            float vx = (t[0] - g_ai_prev[0]) / dt, vy = (t[1] - g_ai_prev[1]) / dt;
+            /* faster than any vehicle is a jump (a reload, a teleport), not a speed; leading by it sent the body so
+             * far away that the engine dropped it */
+            if (vx * vx + vy * vy > AI_MAX_SPEED * AI_MAX_SPEED) { g_ai_vel[0] = g_ai_vel[1] = 0; }
+            else { g_ai_vel[0] += (vx - g_ai_vel[0]) * 0.3f; g_ai_vel[1] += (vy - g_ai_vel[1]) * 0.3f; }
         }
         memcpy(g_ai_prev, t, 12); g_ai_prevt = now;
     }
@@ -1845,7 +1924,7 @@ static int ai_cmd(const char *ln)
         g_ai_src = !strcmp(src, "remote") ? AI_REMOTE : AI_LOCAL;
         ai_vehicle_release();
         g_ai_id = g_ai_marker = 0; g_ai_orders = g_ai_tps = g_ai_spawns = g_ai_glides = 0; g_ai_lastspawn = 0; g_ai_lost = 0; g_ai_glide = 0;
-        g_ai_noveh = 0; g_ai_rescue_wait = 0; g_ai_rescuer = 0;
+        g_ai_noveh = 0; g_ai_rescue_wait = 0; g_ai_rescuer = 0; g_ai_dead = 0;
         g_ai_t0 = g_ai_lastlog = GetTickCount(); g_ai_vel[0] = g_ai_vel[1] = 0; g_ai_prevt = 0;
         logf_("ai: body %s follows %s (spawned once there is a target)", arch, src);
         return 1;
@@ -1948,6 +2027,8 @@ static void net_tick(void)
         if (r == SOCKET_ERROR) { if (WSAGetLastError() == WSAEMSGSIZE) { g_net_drop++; continue; } break; }
         if (r != (int)sizeof p || p.magic != NET_MAGIC || from.sin_addr.s_addr != g_peer.sin_addr.s_addr) { g_net_drop++; continue; }
         p.wpn[sizeof p.wpn - 1] = 0;
+        /* during its reload the peer's body reads (0, 0, -2) for a moment: keep the last real position */
+        if (fabsf(p.pos[0]) < 1.0f && fabsf(p.pos[1]) < 1.0f) memcpy(p.pos, g_remote.pos, sizeof p.pos);
         g_remote = p; g_net_rx++; g_net_lastrx = now;
         memcpy(g_peer_aim, p.aim, sizeof g_peer_aim);
     }
@@ -1990,6 +2071,7 @@ static void net_tick(void)
         }
         p.shots = (unsigned)g_shots;
         memcpy(p.aim, g_aim_dir, sizeof p.aim);
+        p.flags = g_gameover ? NET_DEAD : 0;
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_net_veh && (obj = entity_obj(g_net_veh, &holder)) && !IsBadReadPtr(obj, 0x70)) {
             p.veh = g_net_veh;
@@ -2056,6 +2138,7 @@ static void install_lua(HMODULE m)
     make_detour(g_base + RVA_ALERT, 6, h_alert, 0);
     logf_("lua hooks installed (gettop, _ALERT); command file %s", g_cmdpath);
     install_shot_hook();
+    install_gameover_hook();
 }
 
 static DWORD WINAPI watcher(LPVOID p)
