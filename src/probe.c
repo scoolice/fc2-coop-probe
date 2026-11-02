@@ -1244,6 +1244,23 @@ static int weapon_bullet(void *pc, unsigned long long ent)
     return r ? 1 : 2;
 }
 
+/* aims a muted pawn at a point without firing: moves the marker there and sends ShootAtTarget, which is ended on its
+ * first aim step. The pawn aims at where the target was when the command arrived and keeps the pose. */
+static void pawn_aim_at(unsigned long long id, unsigned long long marker, const float *pt)
+{
+    char code[192], out[16];
+    void *holder = NULL;
+    BYTE *mk = entity_obj(marker, &holder);
+    if (!mk || IsBadWritePtr(mk + 0x60, 12)) logf_("aim: no marker %llu", marker);
+    else {
+        memcpy(mk + 0x60, pt, 12);
+        g_aim_stop = 1; g_aim_low = 0;
+        snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'ShootAtTarget', '%llu') __out = 'ok'", id, marker);
+        lua_eval(code, out, sizeof out);
+    }
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+}
+
 /* winfo <pawn> | wadd <pawn> <weapon entity> | wsel <pawn> <primary|secondary|hand_hand|special> | wdraw <pawn> |
  * wholster <pawn> | sig <pawn> <signal name, or 0x<hash>> | wbullet <pawn> [event entity, default the pawn] |
  * wfire <pawn> <dx dy dz>: one bullet along that direction | wmute <pawn|0>: drop that pawn's own bullets */
@@ -1266,17 +1283,7 @@ static int wpn_cmd(const char *ln)
     else if (sscanf(ln, "wmutebit %i", &op) == 1) { g_mute_bit = op; logf_("wmutebit: agent bit 0x%x held", op); return 1; }
     else if (sscanf(ln, "waimto %llu %llu %f %f %f", &id, &wid, &fd[0], &fd[1], &fd[2]) == 5) {
         /* <pawn> <marker> <x y z>: aim the pawn (wmute'd) at that point without firing */
-        char code[192], out[16];
-        BYTE *mk = entity_obj(wid, &holder);
-        if (!mk || IsBadWritePtr(mk + 0x60, 12)) logf_("waimto: no marker %llu", wid);
-        else {
-            memcpy(mk + 0x60, fd, 12);
-            g_aim_stop = 1; g_aim_low = 0;
-            snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'ShootAtTarget', '%llu') __out = 'ok'", id, wid);
-            lua_eval(code, out, sizeof out);
-            logf_("waimto: %llu at %.1f %.1f %.1f (%s)", id, fd[0], fd[1], fd[2], out);
-        }
-        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        pawn_aim_at(id, wid, fd);
         return 1;
     }
     else if (sscanf(ln, "wlower %d", &op) == 1) { g_aim_low = op; logf_("wlower: %d", op); return 1; }
@@ -1392,11 +1399,25 @@ static void hold_tick(void)
 #pragma pack(push, 1)
 /* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
  * weapon in the sender's hand ("" for none); shots: bullets the sender's guns fired so far; aim: direction of the
- * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up */
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; } NetPkt;
+ * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims; look: camera direction */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x36324346u
+#define NET_MAGIC 0x37324346u
 #define NET_DEAD 1u
+#define NET_AIMING 2u
+/* the local player's control block (pawn data + 0x140): bit 0x08 of byte +4 is on while aiming, +0x38 is the camera's
+ * pitch and +0x40 the yaw of the matrix's local X, in radians */
+static void net_read_aim(NetPkt *p, BYTE *obj)
+{
+    void *pc = obj ? pawn_comp(obj) : NULL;
+    BYTE *pd = pc ? *(BYTE **)((BYTE *)pc + 0x10) : NULL, *b;
+    float pitch, yaw;
+    if (!pd || IsBadReadPtr(pd + 0x140, 0x48)) return;
+    b = pd + 0x140;
+    pitch = *(float *)(b + 0x38); yaw = *(float *)(b + 0x40);
+    if (b[4] & 0x08) p->flags |= NET_AIMING;
+    p->look[0] = -sinf(yaw) * cosf(pitch); p->look[1] = cosf(yaw) * cosf(pitch); p->look[2] = sinf(pitch);
+}
 static SOCKET g_ns = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static DWORD g_net_lastsend, g_net_lastlog, g_net_lastfind, g_net_lastrx;
@@ -1523,6 +1544,12 @@ static unsigned g_ai_orders, g_ai_tps;
  * checkpoint reload or death removes both) or it ignores orders, both are spawned again at the target */
 static char g_ai_arch[96];
 static unsigned long long g_ai_corpse;  /* the pawn standing in for the body while the peer is dead */
+/* the body aims along the peer's bullets at this marker, and lowers its gun g_ai_lower_ms after the last one */
+#define AI_AIM_DIST 30.0f
+#define AI_AIM_EVERY 300
+static unsigned long long g_ai_aimmark;
+static int g_ai_aiming, g_ai_aimready;
+static DWORD g_ai_lastaim, g_ai_lastpeershot, g_ai_lower_ms = 3000;
 static DWORD g_ai_lastspawn, g_ai_lastvalid;
 static int g_ai_lost;
 static unsigned g_ai_spawns, g_ai_stuck;
@@ -1607,6 +1634,8 @@ static void ai_stop(void)
     remove_entity(g_ai_marker);
     if (g_ai_arch[0]) { remove_entity(g_ai_id); ai_weapons_clear(); }
     remove_entity(g_ai_corpse); g_ai_corpse = 0;
+    remove_entity(g_ai_aimmark); g_ai_aimmark = 0;
+    g_mute_id = 0; g_aim_low = 0;
     logf_("ai: stopped (%u orders, %u teleports, %u spawns)", g_ai_orders, g_ai_tps, g_ai_spawns);
     g_ai_src = AI_OFF; g_ai_id = g_ai_marker = 0; g_ai_arch[0] = 0;
 }
@@ -1617,9 +1646,9 @@ static void ai_spawn(const float *t, const char *why)
     char code[192], out[32];
     lua_eval("__out = tostring(IsEntityValid(GetLocalPlayerId()))", out, sizeof out);
     if (strcmp(out, "1") != 0) return;
-    remove_entity(g_ai_marker); remove_entity(g_ai_id);
+    remove_entity(g_ai_marker); remove_entity(g_ai_id); remove_entity(g_ai_aimmark);
     ai_weapons_clear();
-    g_ai_id = g_ai_marker = 0;
+    g_ai_id = g_ai_marker = g_ai_aimmark = 0; g_ai_aiming = 0; g_ai_aimready = 0;
     g_ai_marker = spawn_at("weapons.Secondary.Makarov", t[0], t[1], t[2] + 0.5f);
     if (g_ai_marker) g_ai_id = spawn_at(g_ai_arch, t[0] + 1.0f, t[1], t[2] + 0.3f);
     if (!g_ai_id) return;
@@ -1627,6 +1656,9 @@ static void ai_spawn(const float *t, const char *why)
     g_ai_vel[0] = g_ai_vel[1] = 0; g_ai_prevt = 0; g_ai_glide = 0;
     snprintf(code, sizeof code, "CDominoManager_GetInstance():SendRegisteredEventToEntity('%llu', 'CFCXCountersComponent_SetInvincible') __out = 'ok'", g_ai_id);
     lua_eval(code, out, sizeof out);
+    g_ai_aimmark = spawn_at("weapons.Secondary.Makarov", t[0], t[1], t[2] + 0.5f);
+    /* its own AI must not fire: only the peer's bullets go out, through weapon_bullet */
+    g_mute_id = g_ai_id; g_mute_agent = NULL; g_mute_task = NULL; g_aim_stop = 0; g_aim_low = 0;
     g_ai_spawns++; g_ai_stuck = 0;
     g_ai_seated = 0; g_ai_seattries = 0;
     memcpy(g_ai_last, t, 12); g_ai_lastmove = GetTickCount();
@@ -1682,6 +1714,30 @@ done:
     if (holder) (*(int *)((BYTE *)holder + 8))--;
 }
 
+/* raises the body's gun along a direction of the peer's; a direction it already aims along is not sent again */
+static void ai_aim(DWORD now, const float *dir)
+{
+    static float last[3];
+    float p[3], pt[3], dot = last[0] * dir[0] + last[1] * dir[1] + last[2] * dir[2];
+    char code[96], out[16];
+    if (!g_ai_aimmark || now - g_ai_lastaim < AI_AIM_EVERY) return;
+    if (dir[0] == 0 && dir[1] == 0 && dir[2] == 0) return;
+    if (g_ai_aiming && dot > 0.9995f) return;
+    if (!g_ai_aimready) {
+        snprintf(code, sizeof code, "__out = tostring(IsEntityLoaded('%llu'))", g_ai_aimmark);
+        lua_eval(code, out, sizeof out);
+        if (strcmp(out, "1") != 0) return;
+        g_ai_aimready = 1;
+    }
+    if (!ent_pos(g_ai_id, p)) return;
+    g_ai_lastaim = now;
+    memcpy(last, dir, sizeof last);
+    pt[0] = p[0] + dir[0] * AI_AIM_DIST; pt[1] = p[1] + dir[1] * AI_AIM_DIST; pt[2] = p[2] + 1.5f + dir[2] * AI_AIM_DIST;
+    pawn_aim_at(g_ai_id, g_ai_aimmark, pt);
+    if (!g_ai_aiming) logf_("ai: body raises its gun, aim %.2f %.2f %.2f (last bullet %.2f %.2f %.2f)", dir[0], dir[1], dir[2], g_peer_aim[0], g_peer_aim[1], g_peer_aim[2]);
+    g_ai_aiming = 1;
+}
+
 /* fires the peer's new bullets from the body's gun, one every 30 ms at most and at most 5 behind; only while the
  * body holds the peer's weapon. A count that goes back (the peer restarted) is taken as the new start. */
 static void ai_shoot(DWORD now)
@@ -1693,6 +1749,7 @@ static void ai_shoot(DWORD now)
     g_ai_shots = g_remote.shots;
     if (strcmp(g_ai_wpn, g_remote.wpn) != 0 || !g_ai_wpn[0]) { g_ai_pend = 0; return; }
     g_ai_pend += d;
+    if (d) { g_ai_lastpeershot = now; ai_aim(now, g_peer_aim); }
     if (g_ai_pend > 5) g_ai_pend = 5;
     if (!g_ai_pend || now - g_ai_lastshot < 30) return;
     g_ai_lastshot = now;
@@ -1986,6 +2043,8 @@ static void ai_tick(void)
         }
         ai_weapon(now);
         ai_shoot(now);
+        if ((g_remote.flags & NET_AIMING) && g_ai_wpn[0] && !strcmp(g_ai_wpn, g_remote.wpn)) ai_aim(now, g_remote.look);
+        else if (g_ai_aiming && now - g_ai_lastpeershot > g_ai_lower_ms) { g_ai_aiming = 0; g_aim_low = 1; logf_("ai: body lowers its gun"); }
     }
     speed = sqrtf(g_ai_vel[0] * g_ai_vel[0] + g_ai_vel[1] * g_ai_vel[1]);
     if (!g_ai_glide && g_ai_glide_on > 0 && speed > g_ai_glide_on) {
@@ -2210,6 +2269,7 @@ static void net_tick(void)
         p.shots = (unsigned)g_shots;
         memcpy(p.aim, g_aim_dir, sizeof p.aim);
         p.flags = g_gameover ? NET_DEAD : 0;
+        net_read_aim(&p, obj);
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_net_veh && (obj = entity_obj(g_net_veh, &holder)) && !IsBadReadPtr(obj, 0x70)) {
             p.veh = g_net_veh;

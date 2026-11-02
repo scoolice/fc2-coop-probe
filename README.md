@@ -354,6 +354,21 @@ rescue for a while, so going down again soon is a real death.
 The probe asks the engine once a second which vehicle the player is in; it now only does so while the
 player exists, since during a reload `CVehicle_GetCurrentVehicle` crashed the game (Dunia+0xe7337).
 
+### Aiming
+
+Each packet also carries whether the sender's player aims and the camera's direction (packet magic `FC27`),
+read from the player's control block (pawn data + 0x140): bit 0x08 of byte +4, pitch at +0x38, yaw at +0x40.
+
+The buddy's pose comes from the game's `ShootAtTarget` command at a marker along that direction, 30 m ahead. That
+command's shoot task never ends by itself, so the probe ends it on its first aim step, through its own burst stop
+(FUN_10979990) and finished flag (+0x91), about 30 ms later. The buddy keeps the pose, without firing or jolting. His
+own AI stays muted, and only the peer's bullets go out. He lowers his gun when the peer stops aiming, or 3 s after
+a shot fired from the hip: his pawn attribute task (FUN_109a67c0) keeps setting the AimAt and LookAt bits every
+frame, so it then runs with both settings off. A new direction goes out at most about 3 times a second.
+
+Two copies on one PC (build `589b6996`), the owner aiming, turning and hip-firing in A: "all working and smooth".
+Not tried over two PCs. Guns only.
+
 ### Peer death
 
 Each packet also carries a flag that is set while the sender's game-over screen is up (packet magic
