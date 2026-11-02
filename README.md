@@ -97,6 +97,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `wmutebit <n>` | Test: never set bit `n` of the muted pawn's AI state mask (-1 = none). Bit 0x32 follows its bursts but holding it does not stop the firing |
 | `coords 1\|0` | A small always-on-top strip over the game window with the local, peer and body positions and the body's distance from the peer |
 | `waimto <pawn> <marker> <x y z>` / `wstop` | Test, on a `wmute`'d pawn: aim it at a point without firing, by moving the marker, sending `ShootAtTarget` and ending the shoot task after its first aim step (about 30 ms); it keeps the pose. `wstop` ends the running shoot task the same way |
+| `wlower 1\|0` | Test: lower the `wmute`'d pawn's gun after `waimto`, by running its pawn attribute task with AimAt and LookAt off each frame. `waimto` raises it again |
 | `wbit <n> <0\|1>` | Test: set or clear bit `n` of the muted pawn's AI state mask once (needs `wmute` and a running ShootAtTarget). Bit names: 0x01 DominoActive, 0x32 IsShooting, 0x3d ShootAtTarget |
 | `waim <pawn> <x> <y> <z> [or4 or6 or7]` / `waim 0` | Test: after each update of the pawn, set aim flags in its control block (pawn data + 0x140; default +4\|03 AimAt+LookAt, +6\|04, +7\|01) and the aim point. The pawn then points its gun at its feet: these fields alone do not give an aim pose |
 | `waimat <pawn> <entity>` | Like `waim`, with the entity as the aim target (block +0x18c, +6\|84). Same result: gun at its feet |

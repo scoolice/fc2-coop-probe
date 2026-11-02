@@ -1181,6 +1181,27 @@ static void install_gameover_hook(void)
     logf_("game over hook installed (Dunia+0x%x slots 5, 6)", RVA_GAMEOVER_VT);
 }
 
+/* An aimed pawn keeps a CTaskSetPawnAttribute running after its shoot task ended: its update (slot 14, FUN_109a67c0,
+ * thiscall (task, arg), RET 4) sets the control block's AimAt and LookAt bits every frame from +0x38 and +0x3c
+ * (0 = on, 1 = off, 2 = leave). While g_aim_low, the muted pawn's update runs with both at 1, which lowers its gun. */
+#define RVA_PAWNATTR 0x9a67c0
+typedef int (__attribute__((thiscall)) *pawnattr_t)(void *task, void *arg);
+static pawnattr_t o_pawnattr;
+static int g_aim_low;
+
+static int __attribute__((thiscall)) h_pawnattr(void *task, void *arg)
+{
+    int *k = (int *)task, a, b, r;
+    BYTE *agent = (BYTE *)task + 0x34;
+    agent = *(BYTE **)agent;
+    if (!g_aim_low || !g_mute_id || !agent || pc_entity_id(*(void **)(agent + 0x268)) != g_mute_id) return o_pawnattr(task, arg);
+    a = k[0x38 / 4]; b = k[0x3c / 4];
+    k[0x38 / 4] = 1; k[0x3c / 4] = 1;
+    r = o_pawnattr(task, arg);
+    k[0x38 / 4] = a; k[0x3c / 4] = b;
+    return r;
+}
+
 static void install_shot_hook(void)
 {
     static const BYTE sub8c[6] = { 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00 };  /* SUB ESP,0x8c */
@@ -1190,12 +1211,14 @@ static void install_shot_hook(void)
     static const BYTE sub48[6] = { 0x83, 0xEC, 0x48, 0x53, 0x55, 0x56 };  /* SUB ESP,0x48; PUSH EBX; PUSH EBP; PUSH ESI */
     static const BYTE agbit[7] = { 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x08 };  /* PUSH ESI; MOV ESI,ECX; MOV ECX,[ESP+8] */
     BYTE sub38[8] = { 0x83, 0xEC, 0x38, 0xA1 };  /* SUB ESP,0x38; MOV EAX,[Dunia+0x1645a74] */
+    static const BYTE sub18[6] = { 0x83, 0xEC, 0x18, 0x56, 0x8B, 0xF1 };  /* SUB ESP,0x18; PUSH ESI; MOV ESI,ECX */
     void *p;
     *(BYTE **)(sub38 + 4) = g_base + 0x1645a74;
     if ((p = detour_checked(RVA_STARTSHOOT, sub38, 8, h_startshoot, "start shooting"))) o_startshoot = (startshoot_t)p;
     if ((p = detour_checked(RVA_AIFIRE, sub1c, 5, h_aifire, "AI fire"))) o_aifire = (aifire_t)p;
     if ((p = detour_checked(RVA_FIRESHOT, sub54, 6, h_fireshot, "fire shot"))) o_fireshot = (fireshot_t)p;
     if ((p = detour_checked(RVA_PAWNUPDATE, sub48, 6, h_pawnupd, "pawn update"))) o_pawnupd = (pawnupd_t)p;
+    if ((p = detour_checked(RVA_PAWNATTR, sub18, 6, h_pawnattr, "pawn attribute"))) o_pawnattr = (pawnattr_t)p;
     if ((p = detour_checked(RVA_AGENTBIT, agbit, 7, h_agentbit, "agent state"))) o_agentbit = (agentbit_t)p;
     if ((p = detour_checked(RVA_FIREBULLET, sub8c, 6, h_firebullet, "shot"))) o_firebullet = (firebullet_t)p;
     if ((p = detour_checked(RVA_AIM_PLAYER, frame, 6, h_aim_player, "player aim"))) o_aim_player = (aim_t)p;
@@ -1248,7 +1271,7 @@ static int wpn_cmd(const char *ln)
         if (!mk || IsBadWritePtr(mk + 0x60, 12)) logf_("waimto: no marker %llu", wid);
         else {
             memcpy(mk + 0x60, fd, 12);
-            g_aim_stop = 1;
+            g_aim_stop = 1; g_aim_low = 0;
             snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'ShootAtTarget', '%llu') __out = 'ok'", id, wid);
             lua_eval(code, out, sizeof out);
             logf_("waimto: %llu at %.1f %.1f %.1f (%s)", id, fd[0], fd[1], fd[2], out);
@@ -1256,6 +1279,7 @@ static int wpn_cmd(const char *ln)
         if (holder) (*(int *)((BYTE *)holder + 8))--;
         return 1;
     }
+    else if (sscanf(ln, "wlower %d", &op) == 1) { g_aim_low = op; logf_("wlower: %d", op); return 1; }
     else if (strcmp(ln, "wstop") == 0) {
         BYTE *k = g_mute_task;
         if (!k) { logf_("wstop: no muted shoot task"); return 1; }
