@@ -93,6 +93,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `sig <pawn> <name\|0xhash>` | Send a signal (crc32 of its name) to the pawn's state driver, as the player's input does (`config/inputactionmapcommon.xml`: `startshooting`, `reload`, `jump`, ...). On an AI pawn `startshooting` does nothing |
 | `wbullet <pawn> [entity]` | Fire one bullet from the gun in the pawn's hand: a `shootbullet` animation event handed to its bullet fire strategy. The bullet follows the pawn's aim |
 | `wfire <pawn> <dx> <dy> <dz>` | Like `wbullet`, along the given direction (test: the buddy's bullets do damage enemies) |
+| `wshoot <pawn> [8\|10\|11]` / `wevent <pawn> <name>` | Test, any weapon type: call the held fire strategy's Fire (slot 8, default), StartShoot (slot 10) or StopShoot (slot 11); hand it an animation event such as `attach_projectile`. Both log the strategy's vtable and, for a projectile weapon, its loaded round |
 | `wmute <pawn\|0>` | Test: that pawn's gun does not fire on its own: its weapon manager's fire-one-shot step (Dunia+0x1305f0) and start-shooting step are skipped and any own bullet is dropped (only `wbullet`/`wfire` and the peer's synced shots go out). Logs its AI state changes and the call path of its first 3 own bullets. 0 turns it off |
 | `wmutebit <n>` | Test: never set bit `n` of the muted pawn's AI state mask (-1 = none). Bit 0x32 follows its bursts but holding it does not stop the firing |
 | `coords 1\|0` | A small always-on-top strip over the game window with the local, peer and body positions and the body's distance from the peer |
@@ -286,6 +287,12 @@ Two copies, the player of A driving the save's Datsun for 25 s: the buddy in B g
 seat with its animation 1.0 s after A got in, and B's Datsun stayed a median 0.22 m (max 0.39 m while
 driving) from A's.
 
+### Rockets and flame
+
+Packet magic `FC28`. Rockets count as shots: the sender counts a launch (the projectile strategy's Fire, slot 8), and the body calls the same slot on its launcher, which it holds raised along the peer's camera direction. Flame is a packet flag: the body's flame strategy gets StartShoot (slot 10) when the flag comes on and StopShoot (slot 11) when it goes off or the peer's weapon changes. An aim order makes a pawn draw the weapon it finds best (a rifle over a launcher), so the body carries only the peer's current weapon: the others are taken away on each switch. A weapon of its own it draws anyway (Frank_Bilders_Unarmed has one) is removed too.
+
+Called by hand on one copy, a Frank fired 4 RPG-7 rockets and burned and stopped an LPO-50. Known gap: after its first rocket, none shows in his tube; the shots still go out.
+
 ### Weapons
 
 Each packet also carries the archetype of the weapon in the sender's hand (`weapons.Primary.AK47`, empty
@@ -310,7 +317,7 @@ probe counts them in a detour on the engine's fire-one-bullet function (Dunia+0x
 shooter's id is in its first argument). The receiver fires the new ones from the buddy's gun, at most
 5 behind and 30 ms apart, while the buddy holds the peer's weapon. A gun fires on the `shootbullet`
 event of its firing animation, so the probe hands the gun's bullet fire strategy such an event (see
-the comment above `weapon_bullet`). Only bullet weapons so far, not flame, rockets, grenades or melee.
+the comment above `weapon_bullet`). Rockets and flame are synced too (see "Rockets and flame"); not grenades, melee or the mortar.
 
 Each packet also carries the direction of the sender's last bullet (packet magic `FC25`). The engine
 takes a bullet's origin and direction from one of two aim functions: the camera aim for the
@@ -356,7 +363,7 @@ player exists, since during a reload `CVehicle_GetCurrentVehicle` crashed the ga
 
 ### Aiming
 
-Each packet also carries whether the sender's player aims and the camera's direction (packet magic `FC27`),
+Each packet also carries whether the sender's player aims and the camera's direction (a flag and a direction in the packet),
 read from the player's control block (pawn data + 0x140): bit 0x08 of byte +4, pitch at +0x38, yaw at +0x40.
 
 The buddy's pose comes from the game's `ShootAtTarget` command at a marker along that direction, 30 m ahead. That

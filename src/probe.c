@@ -1225,23 +1225,88 @@ static void install_shot_hook(void)
     if ((p = detour_checked(RVA_AIM_OTHER, frame, 6, h_aim_other, "pawn aim"))) o_aim_other = (aim_t)p;
 }
 
-static int weapon_bullet(void *pc, unsigned long long ent)
+/* the fire strategy of the weapon in the pawn's hand, or NULL */
+static void *held_strategy(void *pc)
 {
-    void *wc = ((getp_t)(g_base + RVA_WM_HELDCOMP))(weapon_mgr(pc)), *strat;
+    void *wc = ((getp_t)(g_base + RVA_WM_HELDCOMP))(weapon_mgr(pc));
+    return wc ? *(void **)((BYTE *)wc + 0x10) : NULL;
+}
+
+/* hands the strategy an animation event; a name over 15 characters is held by pointer, as in an MSVC std::string */
+static char strat_event(void *strat, unsigned long long ent, const char *name)
+{
     void *ev[16];
+    size_t len = strlen(name);
     char r;
-    if (!wc) return 0;
-    strat = *(void **)((BYTE *)wc + 0x10);
-    if (!strat || *(BYTE **)strat != g_base + RVA_BULLETSTRAT_VT) return -1;
     memset(ev, 0, sizeof ev);
     ev[0] = g_base + RVA_ENTITYEVENT_VT;
     memcpy((BYTE *)ev + 0x28, &ent, 8);
-    strcpy((char *)ev + 0xC, "shootbullet");
-    ev[0x1C / 4] = (void *)11; ev[0x20 / 4] = (void *)15;
+    if (len < 16) strcpy((char *)ev + 0xC, name);
+    else ev[0xC / 4] = (void *)name;
+    ev[0x1C / 4] = (void *)len; ev[0x20 / 4] = (void *)(len < 16 ? 15 : len);
     g_own_shot = 1;
     r = ((animevent_t)(*(void ***)strat)[15])(strat, ev);
     g_own_shot = 0;
-    return r ? 1 : 2;
+    return r;
+}
+
+static int weapon_bullet(void *pc, unsigned long long ent)
+{
+    void *strat = held_strategy(pc);
+    if (!strat) return 0;
+    if (*(BYTE **)strat != g_base + RVA_BULLETSTRAT_VT) return -1;
+    return strat_event(strat, ent, "shootbullet") ? 1 : 2;
+}
+
+/* The other fire strategies, thiscall (strategy, pawn component), RET 4. A projectile strategy's Fire (slot 8,
+ * FUN_1019c040) launches its loaded round (+0x178, all ones for none) and makes the next one. A flame strategy burns
+ * from StartShoot (slot 10, FUN_101a5640) to StopShoot (slot 11, FUN_101a58b0). Their vtable entries are swapped for
+ * wrappers that note what the local player does, for the packets. */
+#define RVA_PROJSTRAT_VT 0xe25e08
+#define RVA_FLAMESTRAT_VT 0xe260f8
+static startshoot_t o_rocketfire, o_flamestart, o_flamestop;
+static volatile LONG g_flame;  /* the local player's flamethrower burns */
+
+static void __attribute__((thiscall)) h_rocketfire(void *strat, void *pc)
+{
+    BYTE *s = strat;
+    if (g_net_id && pc_entity_id(pc) == g_net_id && (*(DWORD *)(s + 0x178) & *(DWORD *)(s + 0x17C)) != 0xFFFFFFFF) InterlockedIncrement(&g_shots);
+    o_rocketfire(strat, pc);
+}
+
+static void __attribute__((thiscall)) h_flamestart(void *strat, void *pc)
+{
+    if (g_net_id && pc_entity_id(pc) == g_net_id) { g_flame = 1; logf_("net: local flamethrower on"); }
+    o_flamestart(strat, pc);
+}
+
+static void __attribute__((thiscall)) h_flamestop(void *strat, void *pc)
+{
+    if (g_net_id && pc_entity_id(pc) == g_net_id && g_flame) { g_flame = 0; logf_("net: local flamethrower off"); }
+    o_flamestop(strat, pc);
+}
+
+static void install_weapon_hooks(void)
+{
+    void **pv = (void **)(g_base + RVA_PROJSTRAT_VT), **fv = (void **)(g_base + RVA_FLAMESTRAT_VT);
+    DWORD old;
+    if (pv[8] != g_base + 0x19c040 || fv[10] != g_base + 0x1a5640 || fv[11] != g_base + 0x1a58b0) { logf_("weapon hooks: unexpected vtables, not installed"); return; }
+    o_rocketfire = (startshoot_t)pv[8]; o_flamestart = (startshoot_t)fv[10]; o_flamestop = (startshoot_t)fv[11];
+    VirtualProtect(pv + 8, sizeof(void *), PAGE_READWRITE, &old);
+    pv[8] = (void *)h_rocketfire;
+    VirtualProtect(pv + 8, sizeof(void *), old, &old);
+    VirtualProtect(fv + 10, 2 * sizeof(void *), PAGE_READWRITE, &old);
+    fv[10] = (void *)h_flamestart; fv[11] = (void *)h_flamestop;
+    VirtualProtect(fv + 10, 2 * sizeof(void *), old, &old);
+    logf_("weapon hooks installed (rockets, flame)");
+}
+
+/* logs a strategy, with a projectile strategy's loaded round */
+static void log_strategy(const char *what, unsigned long long id, void *strat)
+{
+    BYTE *s = strat, *vt = *(BYTE **)strat;
+    if (vt == g_base + RVA_PROJSTRAT_VT) logf_("%s %llu: strategy %p vtable %06lx round %08lx %08lx", what, id, s, (DWORD)(vt - g_base), *(DWORD *)(s + 0x178), *(DWORD *)(s + 0x17C));
+    else logf_("%s %llu: strategy %p vtable %06lx", what, id, s, (DWORD)(vt - g_base));
 }
 
 /* aims a muted pawn at a point without firing: moves the marker there and sends ShootAtTarget, which is ended on its
@@ -1263,14 +1328,16 @@ static void pawn_aim_at(unsigned long long id, unsigned long long marker, const 
 
 /* winfo <pawn> | wadd <pawn> <weapon entity> | wsel <pawn> <primary|secondary|hand_hand|special> | wdraw <pawn> |
  * wholster <pawn> | sig <pawn> <signal name, or 0x<hash>> | wbullet <pawn> [event entity, default the pawn] |
- * wfire <pawn> <dx dy dz>: one bullet along that direction | wmute <pawn|0>: drop that pawn's own bullets */
+ * wfire <pawn> <dx dy dz>: one bullet along that direction | wmute <pawn|0>: drop that pawn's own bullets |
+ * wshoot <pawn> [8|10|11]: call the held strategy's Fire (default), StartShoot or StopShoot | wevent <pawn> <name>: hand it an
+ * animation event */
 static int wpn_cmd(const char *ln)
 {
     unsigned long long id, wid;
     char cat[48];
     void *holder = NULL, *pc;
     BYTE *ent, *mgr, *m;
-    int op, on;
+    int op, on, slot = 8;
     float fd[3];
     if (sscanf(ln, "wfire %llu %f %f %f", &id, &fd[0], &fd[1], &fd[2]) == 4) { op = 7; wid = id; }
     else if (strcmp(ln, "waim 0") == 0) { g_aim_pd = NULL; g_aim_holder = NULL; logf_("waim: off"); return 1; }
@@ -1305,6 +1372,8 @@ static int wpn_cmd(const char *ln)
     }
     else if (sscanf(ln, "wmute %llu", &id) == 1) { g_mute_id = id; g_muted = 0; g_mute_agent = NULL; logf_("wmute: %llu's own bullets %s", id, id ? "dropped" : "(none muted)"); return 1; }
     else if (sscanf(ln, "wbullet %llu %llu", &id, &wid) >= 1) { op = 7; if (sscanf(ln, "wbullet %llu %llu", &id, &wid) < 2) wid = id; }
+    else if (sscanf(ln, "wshoot %llu %d", &id, &slot) >= 1) op = 11;
+    else if (sscanf(ln, "wevent %llu %47s", &id, cat) == 2) op = 12;
     else if (sscanf(ln, "winfo %llu", &id) == 1) op = 0;
     else if (sscanf(ln, "wadd %llu %llu", &id, &wid) == 2) op = 1;
     else if (sscanf(ln, "wsel %llu %31s", &id, cat) == 2) op = 2;
@@ -1340,6 +1409,21 @@ static int wpn_cmd(const char *ln)
         goto done;
     }
     if (!m || IsBadReadPtr(m, 0x80)) { logf_("wpn %llu: no weapon manager", id); goto done; }
+    if (op == 11 || op == 12) {
+        void *strat = held_strategy(pc);
+        if (!strat) { logf_("%s %llu: no weapon in hand", op == 11 ? "wshoot" : "wevent", id); goto done; }
+        log_strategy(op == 11 ? "wshoot" : "wevent", id, strat);
+        if (op == 12) logf_("wevent %llu: %s %s", id, cat, strat_event(strat, id, cat) ? "handled" : "not handled");
+        else if (slot != 8 && slot != 10 && slot != 11) logf_("wshoot %llu: slot must be 8, 10 or 11", id);
+        else {
+            g_own_shot = 1;
+            ((startshoot_t)(*(void ***)strat)[slot])(strat, pc);
+            g_own_shot = 0;
+            logf_("wshoot %llu: slot %d called", id, slot);
+        }
+        log_strategy("after", id, strat);
+        goto done;
+    }
     if (op == 7) {
         int r, forced = ln[1] == 'f';
         if (forced) { memcpy(g_force_dir, fd, sizeof fd); g_force_id = id; }
@@ -1398,13 +1482,14 @@ static void hold_tick(void)
 /* ---- own UDP transport: position exchange between two copies ---- */
 #pragma pack(push, 1)
 /* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
- * weapon in the sender's hand ("" for none); shots: bullets the sender's guns fired so far; aim: direction of the
- * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims; look: camera direction */
+ * weapon in the sender's hand ("" for none); shots: bullets and rockets the sender fired so far; aim: direction of the
+ * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims, NET_FLAME while its flamethrower burns; look: camera direction */
 typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x37324346u
+#define NET_MAGIC 0x38324346u
 #define NET_DEAD 1u
 #define NET_AIMING 2u
+#define NET_FLAME 4u
 /* the local player's control block (pawn data + 0x140): bit 0x08 of byte +4 is on while aiming, +0x38 is the camera's
  * pitch and +0x40 the yaw of the matrix's local X, in radians */
 static void net_read_aim(NetPkt *p, BYTE *obj)
@@ -1568,7 +1653,8 @@ static DWORD g_ai_lastwpn;
 /* the peer's shots: the count last seen in its packets (g_ai_shots_on once it is known) and bullets still to fire */
 static unsigned g_ai_shots, g_ai_pend, g_ai_fired;
 static int g_ai_shots_on;
-static DWORD g_ai_lastshot;
+static DWORD g_ai_lastshot, g_ai_lastkeep;
+static int g_ai_flaming;
 static void ai_weapons_clear(void);
 
 static void ai_vehicle_release(void)
@@ -1671,10 +1757,12 @@ static void ai_weapons_clear(void)
     int k;
     for (k = 0; k < 4; k++) { remove_entity(g_ai_wid[k]); g_ai_wid[k] = 0; g_ai_warch[k][0] = 0; }
     g_ai_wpn[0] = 0;
+    g_ai_flaming = 0;
 }
 
 /* once a second while the body's weapon differs from the peer's: spawn the peer's weapon (once per category),
- * give it to the body and select its category, which draws it; nothing in the peer's hand holsters */
+ * give it to the body and select its category, which draws it; nothing in the peer's hand holsters. The body carries
+ * only that weapon: an aim order makes a pawn draw what it finds best (a rifle over a launcher), so the others go. */
 static void ai_weapon(DWORD now)
 {
     void *holder = NULL, *wh = NULL, *pc;
@@ -1709,6 +1797,19 @@ static void ai_weapon(DWORD now)
     weapon_select(pc, g_wpn_cats[k][1]);
     strcpy(g_ai_wpn, want);
     logf_("ai: body draws %s (%s)", want, g_wpn_cats[k][1]);
+    {
+        int j;
+        for (j = 0; j < 4; j++) {
+            void *oh = NULL, *owc;
+            BYTE *o;
+            if (j == k || !g_ai_wid[j]) continue;
+            o = entity_obj(g_ai_wid[j], &oh);
+            if (o && (owc = weapon_comp(o))) ((call2_t)(g_base + RVA_WM_REMOVE))(weapon_mgr(pc), owc, 0);
+            if (oh) (*(int *)((BYTE *)oh + 8))--;
+            remove_entity(g_ai_wid[j]);
+            g_ai_wid[j] = 0; g_ai_warch[j][0] = 0;
+        }
+    }
 done:
     if (wh) (*(int *)((BYTE *)wh + 8))--;
     if (holder) (*(int *)((BYTE *)holder + 8))--;
@@ -1738,27 +1839,76 @@ static void ai_aim(DWORD now, const float *dir)
     g_ai_aiming = 1;
 }
 
-/* fires the peer's new bullets from the body's gun, one every 30 ms at most and at most 5 behind; only while the
- * body holds the peer's weapon. A count that goes back (the peer restarted) is taken as the new start. */
+/* What the body holds, before ai_weapon can change it. An aim order can make a pawn with weapons of its own draw one
+ * of those (even Frank_Bilders_Unarmed): that weapon is taken from it and removed, and the peer's drawn again, every
+ * 2 s at most. Any weapon the body was given for the peer is left alone (a draw takes a moment, so the previous one
+ * is still in hand after a switch). Its flamethrower burns while the peer's does and both hold that
+ * weapon; StopShoot goes to the one still in hand. */
+static void ai_held(DWORD now)
+{
+    void *holder = NULL, *pc, *strat;
+    BYTE *ent = entity_obj(g_ai_id, &holder);
+    int same = g_ai_wpn[0] && !strcmp(g_ai_wpn, g_remote.wpn), want, flame, k;
+    unsigned long long held;
+    pc = ent ? pawn_comp(ent) : NULL;
+    if (!pc) goto done;
+    held = held_weapon_id(ent);
+    if (same && held && now - g_ai_lastkeep >= 2000 && now - g_ai_lastwpn >= 2000) {
+        int ours = 0;
+        for (k = 0; k < 4; k++) if (held == g_ai_wid[k]) ours = 1;
+        for (k = 0; k < 4 && strncmp(g_ai_wpn, g_wpn_cats[k][0], strlen(g_wpn_cats[k][0])); k++) ;
+        if (!ours && k < 4 && g_ai_wid[k]) {
+            BYTE *mgr = weapon_mgr(pc);
+            void *wc = ((getp_t)(g_base + RVA_WM_HELDCOMP))(mgr);
+            g_ai_lastkeep = now;
+            if (wc) ((call2_t)(g_base + RVA_WM_REMOVE))(mgr, wc, 0);
+            remove_entity(held);
+            weapon_select(pc, g_wpn_cats[k][1]);
+            logf_("ai: body drew its own weapon %llu: removed, back to %s", held, g_ai_wpn);
+        }
+    }
+    strat = held_strategy(pc);
+    flame = strat && *(BYTE **)strat == g_base + RVA_FLAMESTRAT_VT;
+    want = same && (g_remote.flags & NET_FLAME);
+    if (want) { g_ai_lastpeershot = now; ai_aim(now, g_remote.look); }
+    if (want != g_ai_flaming && (flame || !want)) {
+        if (flame) ((startshoot_t)(*(void ***)strat)[want ? 10 : 11])(strat, pc);
+        g_ai_flaming = want;
+        logf_("ai: body's flamethrower %s", want ? "on" : "off");
+    }
+done:
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+}
+
+/* fires the peer's new bullets and rockets from the body's gun, one every 30 ms at most and at most 5 behind; only
+ * while the body holds the peer's weapon. A count that goes back (the peer restarted) is taken as the new start. */
 static void ai_shoot(DWORD now)
 {
-    void *holder = NULL, *pc;
+    void *holder = NULL, *pc, *strat;
     BYTE *ent;
+    int rocket;
     unsigned d = g_remote.shots - g_ai_shots;
     if (!g_ai_shots_on || d > 1000) { g_ai_shots = g_remote.shots; g_ai_shots_on = 1; g_ai_pend = 0; return; }
     g_ai_shots = g_remote.shots;
     if (strcmp(g_ai_wpn, g_remote.wpn) != 0 || !g_ai_wpn[0]) { g_ai_pend = 0; return; }
     g_ai_pend += d;
-    if (d) { g_ai_lastpeershot = now; ai_aim(now, g_peer_aim); }
     if (g_ai_pend > 5) g_ai_pend = 5;
-    if (!g_ai_pend || now - g_ai_lastshot < 30) return;
-    g_ai_lastshot = now;
     ent = entity_obj(g_ai_id, &holder);
     pc = ent ? pawn_comp(ent) : NULL;
-    if (pc) {
-        int r = weapon_bullet(pc, g_ai_id);
+    strat = pc ? held_strategy(pc) : NULL;
+    rocket = strat && *(BYTE **)strat == g_base + RVA_PROJSTRAT_VT;
+    if (d) { g_ai_lastpeershot = now; ai_aim(now, rocket ? g_remote.look : g_peer_aim); }
+    if (pc && g_ai_pend && now - g_ai_lastshot >= 30) {
+        int r = 1;
+        g_ai_lastshot = now;
+        if (rocket) {
+            g_own_shot = 1;
+            ((startshoot_t)(*(void ***)strat)[8])(strat, pc);
+            g_own_shot = 0;
+            logf_("ai: body fired a rocket for the peer");
+        } else r = weapon_bullet(pc, g_ai_id);
         g_ai_pend--;
-        if (r == 1 && ++g_ai_fired % 20 == 1) logf_("ai: body fired %u bullet(s) for the peer", g_ai_fired);
+        if (r == 1 && !rocket && ++g_ai_fired % 20 == 1) logf_("ai: body fired %u bullet(s) for the peer", g_ai_fired);
         else if (r != 1) { logf_("ai: body could not fire (%d)", r); g_ai_pend = 0; }
     }
     if (holder) (*(int *)((BYTE *)holder + 8))--;
@@ -2041,6 +2191,7 @@ static void ai_tick(void)
             ai_spawn(t, "peer left the vehicle");
             return;
         }
+        ai_held(now);
         ai_weapon(now);
         ai_shoot(now);
         if ((g_remote.flags & NET_AIMING) && g_ai_wpn[0] && !strcmp(g_ai_wpn, g_remote.wpn)) ai_aim(now, g_remote.look);
@@ -2270,6 +2421,11 @@ static void net_tick(void)
         memcpy(p.aim, g_aim_dir, sizeof p.aim);
         p.flags = g_gameover ? NET_DEAD : 0;
         net_read_aim(&p, obj);
+        if (g_flame) {  /* a weapon switch may not pass through StopShoot */
+            void *fpc = obj ? pawn_comp(obj) : NULL, *fs = fpc ? held_strategy(fpc) : NULL;
+            if (!fs || *(BYTE **)fs != g_base + RVA_FLAMESTRAT_VT) { g_flame = 0; logf_("net: local flamethrower off (no longer in hand)"); }
+            else p.flags |= NET_FLAME;
+        }
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_net_veh && (obj = entity_obj(g_net_veh, &holder)) && !IsBadReadPtr(obj, 0x70)) {
             p.veh = g_net_veh;
@@ -2337,6 +2493,7 @@ static void install_lua(HMODULE m)
     logf_("lua hooks installed (gettop, _ALERT); command file %s", g_cmdpath);
     install_shot_hook();
     install_gameover_hook();
+    install_weapon_hooks();
 }
 
 static DWORD WINAPI watcher(LPVOID p)
