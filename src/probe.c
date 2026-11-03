@@ -1937,6 +1937,38 @@ static void ai_aim(DWORD now, const float *dir)
     g_ai_aiming = 1;
 }
 
+/* While the peer stands still and the body has caught up, the body turns to the peer's facing (the packet's dir, the
+ * entity's local X axis: yaw 0 = (1, 0), as CEntity::SetEuler takes it) at 270 degrees a second. Moving, the AI
+ * steers it; aiming or burning, the aim order does. The AI keeps a yaw set this way while it stands. */
+#define AI_FACE_RATE 4.71f
+static void ai_face(DWORD now)
+{
+    static DWORD still, last;
+    void *holder = NULL;
+    BYTE *ent;
+    float *m, dx, dy, cur, d, step;
+    DWORD dt = last ? now - last : 0;
+    last = now;
+    if (sqrtf(g_ai_vel[0] * g_ai_vel[0] + g_ai_vel[1] * g_ai_vel[1]) > 0.3f || g_ai_glide) { still = now; return; }
+    if (now - still < 500 || g_ai_aiming || g_ai_flaming || (g_remote.dir[0] == 0 && g_remote.dir[1] == 0)) return;
+    ent = entity_obj(g_ai_id, &holder);
+    if (!ent || IsBadReadPtr(ent, 0x70)) goto done;
+    m = (float *)(ent + 0x30);
+    dx = m[12] - g_remote.pos[0]; dy = m[13] - g_remote.pos[1];
+    if (dx * dx + dy * dy > 2.5f * 2.5f) goto done;
+    cur = atan2f(m[1], m[0]);
+    d = atan2f(g_remote.dir[1], g_remote.dir[0]) - cur;
+    while (d > 3.14159265f) d -= 6.2831853f;
+    while (d < -3.14159265f) d += 6.2831853f;
+    if (fabsf(d) < 0.02f) goto done;
+    step = AI_FACE_RATE * dt / 1000.0f;
+    if (step > 0.3f) step = 0.3f;
+    if (fabsf(d) > step) d = d > 0 ? step : -step;
+    ((setvec_t)(g_base + RVA_SETEULER))(ent, 0.0f, 0.0f, cur + d);
+done:
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+}
+
 /* What the body holds, before ai_weapon can change it. An aim order can make a pawn with weapons of its own draw one
  * of those (even Frank_Bilders_Unarmed): that weapon is taken from it and removed, and the peer's drawn again, every
  * 2 s at most. Any weapon the body was given for the peer is left alone (a draw takes a moment, so the previous one
@@ -2317,6 +2349,7 @@ static void ai_tick(void)
         ai_shoot(now);
         if ((g_remote.flags & NET_AIMING) && g_ai_wpn[0] && !strcmp(g_ai_wpn, g_remote.wpn)) ai_aim(now, g_remote.look);
         else if (g_ai_aiming && now - g_ai_lastpeershot > g_ai_lower_ms) { g_ai_aiming = 0; g_aim_low = 1; logf_("ai: body lowers its gun"); }
+        ai_face(now);
     }
     speed = sqrtf(g_ai_vel[0] * g_ai_vel[0] + g_ai_vel[1] * g_ai_vel[1]);
     if (!g_ai_glide && g_ai_glide_on > 0 && speed > g_ai_glide_on) {

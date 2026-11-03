@@ -288,6 +288,10 @@ Two copies, the player of A driving the save's Datsun for 25 s: the buddy in B g
 seat with its animation 1.0 s after A got in, and B's Datsun stayed a median 0.22 m (max 0.39 m while
 driving) from A's.
 
+### Facing
+
+While the peer stands still (target speed under 0.3 m/s for 0.5 s) and the body is within 2.5 m of it, the body turns to the peer's facing at 270 degrees a second with `CEntity::SetEuler` (the packet's direction is the entity's local X axis, which is what SetEuler's yaw gives). The AI keeps a yaw set this way while the pawn stands; owner saw Frank turn with `vset`. Moving, the AI steers; aiming or burning, the aim order faces the body.
+
 ### Crouch, sprint and jumps
 
 Packet magic `FC29`. The player's movement keys end in the pawn's control block (pawn data + 0x140; the input action dispatcher Dunia+0x144760): crouch toggles +0xa4, jump sets +4 bit 0x20, sprint +4 bit 0x40. The sender sends its crouch and sprint state as flags and counts its jumps (the jump bit coming on, seen in the pawn-update hook). The body's copy writes the same fields into the body's control block before and after each of its updates. A jump is queued with the peer's position and made when the body comes within 1.2 m of it (or 1.5 s late), at most one per 0.9 s so that it has landed; the sender counts at most one jump per 0.3 s. An AI pawn crouches and rises on a jump this way, but plays no jump animation. `ctl` does the same by hand on any pawn.
