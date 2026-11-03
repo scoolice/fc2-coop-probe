@@ -93,7 +93,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `sig <pawn> <name\|0xhash>` | Send a signal (crc32 of its name) to the pawn's state driver, as the player's input does (`config/inputactionmapcommon.xml`: `startshooting`, `reload`, `jump`, ...). On an AI pawn `startshooting` does nothing |
 | `wbullet <pawn> [entity]` | Fire one bullet from the gun in the pawn's hand: a `shootbullet` animation event handed to its bullet fire strategy. The bullet follows the pawn's aim |
 | `wfire <pawn> <dx> <dy> <dz>` | Like `wbullet`, along the given direction (test: the buddy's bullets do damage enemies) |
-| `ctl <pawn> crouch\|sprint 0\|1\|-1` / `ctl <pawn> jump [updates]` / `ctl jumpfor <updates>` / `ctl 0` | Test: write the player's movement fields into one pawn's control block before and after each of its updates: crouch (+0xa4), sprint (+4 bit 0x40), jump (+4 bit 0x20 for a few updates; `ctl jumpfor` sets how many, default 6, also for the body's synced jumps). -1 leaves the field to the game |
+| `ctl <pawn> crouch\|sprint 0\|1\|-1` / `ctl <pawn> jump [updates]` / `ctl jumpfor <updates>` / `ctl <pawn> move <vx> <vy>\|off` / `ctl 0` | Test: write the player's movement fields into one pawn's control block before and after each of its updates: crouch (+0xa4), sprint (+4 bit 0x40), jump (+4 bit 0x20 for a few updates; `ctl jumpfor` sets how many, default 6, also for the body's synced jumps), desired movement (+0xb0/+0xb4, world m/s, what the player's movement code writes). -1 leaves the field to the game |
 | `wshoot <pawn> [8\|10\|11]` / `wevent <pawn> <name>` | Test, any weapon type: call the held fire strategy's Fire (slot 8, default), StartShoot (slot 10) or StopShoot (slot 11); hand it an animation event such as `attach_projectile`. Both log the strategy's vtable and, for a projectile weapon, its loaded round |
 | `wmute <pawn\|0>` | Test: that pawn's gun does not fire on its own: its weapon manager's fire-one-shot step (Dunia+0x1305f0) and start-shooting step are skipped and any own bullet is dropped (only `wbullet`/`wfire` and the peer's synced shots go out). Logs its AI state changes and the call path of its first 3 own bullets. 0 turns it off |
 | `wmutebit <n>` | Test: never set bit `n` of the muted pawn's AI state mask (-1 = none). Bit 0x32 follows its bursts but holding it does not stop the firing |
@@ -287,6 +287,10 @@ in is left alone. Old builds drop the new packets (magic `FC22`), so both sides 
 Two copies, the player of A driving the save's Datsun for 25 s: the buddy in B got into the driver's
 seat with its animation 1.0 s after A got in, and B's Datsun stayed a median 0.22 m (max 0.39 m while
 driving) from A's.
+
+### Driven legs
+
+Packet magic `FC2A`. The player's movement code ends by writing its desired movement into the control block (+0xb0/+0xb4/+0xb8, world m/s; FUN_10143de0), and the pawn's locomotion follows it with its own walk, run and sprint animations; an AI pawn does too (one copy, `ctl <Frank> move`: 1.5 m/s walked at ~1.5, 3.8 ran at ~3.6, 7.9 sprinted at ~7.4, stopping within 0.7 m). The sender sends its own; the body's copy, on foot, writes the peer's movement plus a pull toward the peer's position (1.2 per second, at most 4 m/s) into the body's block on each update, and holds MoveTo (`MoveToStopped` instead). The 10 m teleport, the glide above vehicle speed and the vehicle seat stay. `aidrive 0` goes back to the MoveTo follower.
 
 ### Facing
 

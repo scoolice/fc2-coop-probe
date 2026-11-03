@@ -1137,11 +1137,14 @@ static unsigned g_aim_or4 = 0x03, g_aim_or6 = 0x04, g_aim_or7 = 0x01;
  * +0xa4 (FUN_10143700), jump sets +4 bit 0x20 (FUN_10143780; when crouched it stands up instead), sprint sets +4 bit
  * 0x40. ctl writes those for one pawn before and after each of its updates: crouch and sprint held, jump for a few. */
 static BYTE *g_ctl_pd;
-static int g_ctl_crouch = -1, g_ctl_sprint = -1, g_ctl_jump;
+static int g_ctl_crouch = -1, g_ctl_sprint = -1, g_ctl_jump, g_ctl_move;
+static float g_ctl_vel[2];  /* +0xb0/+0xb4: the desired movement in world space, m/s (FUN_10143de0 writes the player's) */
 /* co-op: the local player's pawn data and jumps so far (for the packets); the body's pawn data and what the peer does */
 static BYTE *g_net_pd, *g_body_pd;
 static volatile LONG g_jumps;
 static int g_jump_held, g_body_crouch, g_body_sprint, g_body_jump, g_jump_updates = 6;
+static int g_body_move;       /* the body is driven: g_body_vel goes into its desired movement each update */
+static float g_body_vel[2];
 
 static void ctl_apply(BYTE *pd)
 {
@@ -1150,6 +1153,7 @@ static void ctl_apply(BYTE *pd)
     if (g_ctl_sprint == 1) blk[4] |= 0x40;
     else if (g_ctl_sprint == 0) blk[4] &= ~0x40;
     if (g_ctl_jump > 0) { blk[4] |= 0x20; g_ctl_jump--; }
+    if (g_ctl_move) { *(float *)(blk + 0xb0) = g_ctl_vel[0]; *(float *)(blk + 0xb4) = g_ctl_vel[1]; *(float *)(blk + 0xb8) = 0; }
 }
 
 /* the height of a jumper for 1.5 s after its jump, logged as one line (ms after the jump : metres above the start);
@@ -1177,6 +1181,7 @@ static void body_apply(BYTE *pd)
     if (g_body_sprint) blk[4] |= 0x40;
     else blk[4] &= ~0x40;
     if (g_body_jump > 0) { blk[4] |= 0x20; g_body_jump--; }
+    if (g_body_move) { *(float *)(blk + 0xb0) = g_body_vel[0]; *(float *)(blk + 0xb4) = g_body_vel[1]; *(float *)(blk + 0xb8) = 0; }
 }
 
 /* a jump of the local player: the jump bit coming on, at most one per 300 ms (one jump can set it twice) */
@@ -1391,7 +1396,8 @@ static void pawn_aim_at(unsigned long long id, unsigned long long marker, const 
  * wfire <pawn> <dx dy dz>: one bullet along that direction | wmute <pawn|0>: drop that pawn's own bullets |
  * wshoot <pawn> [8|10|11]: call the held strategy's Fire (default), StartShoot or StopShoot | wevent <pawn> <name>: hand it an
  * animation event */
-/* ctl <pawn> crouch 0|1|-1 | ctl <pawn> sprint 0|1|-1 | ctl <pawn> jump [updates] | ctl 0 (-1 = leave to the game) |
+/* ctl <pawn> crouch 0|1|-1 | ctl <pawn> sprint 0|1|-1 | ctl <pawn> jump [updates] | ctl <pawn> move <vx> <vy> | ctl <pawn> move off |
+ * ctl 0 (-1 = leave to the game) |
  * ctl jumpfor <updates>: how many updates a jump holds the bit (also the body's synced jumps) */
 static int ctl_cmd(const char *ln)
 {
@@ -1401,17 +1407,22 @@ static int ctl_cmd(const char *ln)
     void *holder = NULL, *pc;
     BYTE *ent;
     if (sscanf(ln, "ctl jumpfor %d", &v) == 1) { g_jump_updates = v; logf_("ctl: jumps hold the bit for %d update(s)", v); return 1; }
-    if (strcmp(ln, "ctl 0") == 0) { g_ctl_pd = NULL; g_ctl_crouch = g_ctl_sprint = -1; g_ctl_jump = 0; logf_("ctl: off"); return 1; }
+    if (strcmp(ln, "ctl 0") == 0) { g_ctl_pd = NULL; g_ctl_crouch = g_ctl_sprint = -1; g_ctl_jump = 0; g_ctl_move = 0; logf_("ctl: off"); return 1; }
     if (sscanf(ln, "ctl %llu %15s %d", &id, what, &v) < 2) return 0;
     ent = entity_obj(id, &holder);
     pc = ent ? pawn_comp(ent) : NULL;
     if (!pc) logf_("ctl %llu: no pawn", id);
     else {
         BYTE *pd = *(BYTE **)((BYTE *)pc + 0x10), *blk = pd + 0x140;
-        if (pd != g_ctl_pd) { g_ctl_crouch = g_ctl_sprint = -1; g_ctl_jump = 0; g_ctl_pd = pd; }
+        if (pd != g_ctl_pd) { g_ctl_crouch = g_ctl_sprint = -1; g_ctl_jump = 0; g_ctl_move = 0; g_ctl_pd = pd; }
         if (!strcmp(what, "crouch")) g_ctl_crouch = v;
         else if (!strcmp(what, "sprint")) g_ctl_sprint = v;
         else if (!strcmp(what, "jump")) g_ctl_jump = v > 0 ? v : g_jump_updates;
+        else if (!strcmp(what, "move")) {
+            g_ctl_move = sscanf(ln, "ctl %*u move %f %f", &g_ctl_vel[0], &g_ctl_vel[1]) == 2;
+            logf_("ctl %llu: move %s %.2f %.2f (block velocity now %.2f %.2f %.2f)", id, g_ctl_move ? "on" : "off", g_ctl_vel[0], g_ctl_vel[1],
+                  *(float *)(blk + 0xb0), *(float *)(blk + 0xb4), *(float *)(blk + 0xb8));
+        }
         logf_("ctl %llu: pawn data %p %s %d (block +4 %08x +0x8c %d +0xa4 %d)", id, pd, what, v, *(unsigned *)(blk + 4), *(int *)(blk + 0x8c), *(int *)(blk + 0xa4));
     }
     if (holder) (*(int *)((BYTE *)holder + 8))--;
@@ -1571,10 +1582,11 @@ static void hold_tick(void)
 #pragma pack(push, 1)
 /* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
  * weapon in the sender's hand ("" for none); shots: bullets and rockets the sender fired so far; aim: direction of the
- * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims, NET_FLAME while its flamethrower burns, NET_CROUCH / NET_SPRINT while its player crouches / sprints; look: camera direction; jumps: jumps the sender's player made so far */
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; unsigned jumps; } NetPkt;
+ * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims, NET_FLAME while its flamethrower burns, NET_CROUCH / NET_SPRINT while its player crouches / sprints; look: camera direction; jumps: jumps the sender's player made so far;
+ * mv: the sender's desired movement (control block +0xb0/+0xb4, world m/s) */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; unsigned jumps; float mv[2]; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x39324346u
+#define NET_MAGIC 0x41324346u
 #define NET_DEAD 1u
 #define NET_AIMING 2u
 #define NET_FLAME 4u
@@ -1775,9 +1787,18 @@ static int ent_pos(unsigned long long id, float *out)
     return ok;
 }
 
+static int g_ai_drive = 1;  /* drive the body's legs with the peer's movement instead of MoveTo (aidrive) */
+
 static void ai_order(const char *why)
 {
     char code[192], out[32];
+    if (g_ai_drive && g_ai_src == AI_REMOTE) {
+        snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
+        lua_eval(code, out, sizeof out);
+        g_ai_lastorder = GetTickCount();
+        logf_("ai: driven, no MoveTo (%s)", why);
+        return;
+    }
     snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveTo', '%llu', %d, 0) __out = 'ok'",
              g_ai_id, g_ai_marker, g_ai_speed);
     lua_eval(code, out, sizeof out);
@@ -2295,12 +2316,30 @@ static void ai_order_later(DWORD now)
     g_ai_order_at = now + 200; g_ai_lastorder = now;
 }
 
+/* The player's movement code writes its desired movement into the control block (+0xb0, world m/s) and the pawn's
+ * locomotion follows it with its own walk, run and sprint animations; an AI pawn does too. The body's is the peer's
+ * movement plus a pull toward the peer's position (AI_DRIVE_K per second, at most AI_DRIVE_PULL m/s), so it keeps to
+ * the peer's path without MoveTo. Standing within 0.15 m of a standing peer, it stands. */
+#define AI_DRIVE_K 1.2f
+#define AI_DRIVE_PULL 4.0f
+static void ai_legs(const float *t, const float *p)
+{
+    float ex = t[0] - p[0], ey = t[1] - p[1], e = sqrtf(ex * ex + ey * ey), cx, cy;
+    float mx = g_remote.mv[0], my = g_remote.mv[1];
+    if (e < 0.15f && mx * mx + my * my < 0.01f) { g_body_vel[0] = g_body_vel[1] = 0; g_body_move = 1; return; }
+    cx = ex * AI_DRIVE_K; cy = ey * AI_DRIVE_K;
+    if (e * AI_DRIVE_K > AI_DRIVE_PULL) { cx *= AI_DRIVE_PULL / (e * AI_DRIVE_K); cy *= AI_DRIVE_PULL / (e * AI_DRIVE_K); }
+    g_body_vel[0] = mx + cx; g_body_vel[1] = my + cy;
+    g_body_move = 1;
+}
+
 static void ai_tick(void)
 {
     DWORD now;
     float t[3], p[3], d, moved, speed, lead;
     void *holder = NULL;
     BYTE *m;
+    g_body_move = 0;
     if (g_ai_src == AI_OFF || g_nstates == 0 || GetCurrentThreadId() != g_states[0].thread) return;
     now = GetTickCount();
     if (!ai_target(now, t)) return;
@@ -2395,6 +2434,15 @@ static void ai_tick(void)
         memcpy(g_ai_last, t, 12); g_ai_lastmove = now;
         return;
     }
+    if (g_ai_drive && g_ai_src == AI_REMOTE) {
+        ai_legs(t, p);
+        if (now - g_ai_lastlog >= 1000) {
+            g_ai_lastlog = now;
+            logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f driven %.2f %.2f (peer %.2f %.2f) tps %u glide %u", t[0], t[1], t[2], p[0], p[1], p[2], d,
+                  g_body_vel[0], g_body_vel[1], g_remote.mv[0], g_remote.mv[1], g_ai_tps, g_ai_glides);
+        }
+        return;
+    }
     moved = fabsf(p[0] - g_ai_last[0]) + fabsf(p[1] - g_ai_last[1]);
     if (moved > 0.3f) { memcpy(g_ai_last, p, 12); g_ai_lastmove = now; g_ai_stuck = 0; }
     else if (d > g_ai_stall_m && now - g_ai_lastmove > g_ai_stall_ms && now - g_ai_lastorder > g_ai_stall_ms) {
@@ -2410,13 +2458,14 @@ static void ai_tick(void)
 
 /* aibody <archetype> <remote|local> | aifollow <pawn id> <remote|local|circle> [radius speed] | aispeed <n> |
  * aitp <metres> | aistall <ms> <metres> | ailead <seconds> | aiglide <on m/s> <off m/s> (0 = never) |
- * airescue <seconds> (0 = off) | aistop */
+ * airescue <seconds> (0 = off) | aidrive 0|1 | aistop */
 static int ai_cmd(const char *ln)
 {
     unsigned long long id;
     char src[16], code[192], out[32], arch[96];
     float r = 0, v = 0, p[3];
     int n;
+    if (sscanf(ln, "aidrive %d", &n) == 1) { g_ai_drive = n; logf_("ai: %s", n ? "driven by the peer's movement" : "MoveTo follower"); if (!n && g_ai_src) ai_order("drive off"); return 1; }
     if (sscanf(ln, "aibody %95s %15s", arch, src) == 2) {
         if (g_ai_src) ai_stop();
         if (strcmp(src, "remote") && strcmp(src, "local")) { logf_("ai: aibody follows remote or local"); return 1; }
@@ -2588,6 +2637,7 @@ static void net_tick(void)
             if (pd && *(int *)(pd + 0x140 + 0xa4)) p.flags |= NET_CROUCH;
             if (pd && (pd[0x140 + 4] & 0x40)) p.flags |= NET_SPRINT;
             p.jumps = (unsigned)g_jumps;
+            if (pd) { p.mv[0] = *(float *)(pd + 0x140 + 0xb0); p.mv[1] = *(float *)(pd + 0x140 + 0xb4); }
         }
         if (g_flame) {  /* a weapon switch may not pass through StopShoot */
             void *fpc = obj ? pawn_comp(obj) : NULL, *fs = fpc ? held_strategy(fpc) : NULL;
