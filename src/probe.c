@@ -1133,9 +1133,69 @@ static BYTE *g_aim_pd, *g_aim_holder;  /* g_aim_holder: aim target entity (block
 static float g_aim_pt[3];
 static unsigned g_aim_or4 = 0x03, g_aim_or6 = 0x04, g_aim_or7 = 0x01;
 
+/* The player's movement keys end in the same control block (FUN_10144760, the input action dispatcher): crouch toggles
+ * +0xa4 (FUN_10143700), jump sets +4 bit 0x20 (FUN_10143780; when crouched it stands up instead), sprint sets +4 bit
+ * 0x40. ctl writes those for one pawn before and after each of its updates: crouch and sprint held, jump for a few. */
+static BYTE *g_ctl_pd;
+static int g_ctl_crouch = -1, g_ctl_sprint = -1, g_ctl_jump;
+/* co-op: the local player's pawn data and jumps so far (for the packets); the body's pawn data and what the peer does */
+static BYTE *g_net_pd, *g_body_pd;
+static volatile LONG g_jumps;
+static int g_jump_held, g_body_crouch, g_body_sprint, g_body_jump, g_jump_updates = 6;
+
+static void ctl_apply(BYTE *pd)
+{
+    BYTE *blk = pd + 0x140;
+    if (g_ctl_crouch >= 0) *(int *)(blk + 0xa4) = g_ctl_crouch;
+    if (g_ctl_sprint == 1) blk[4] |= 0x40;
+    else if (g_ctl_sprint == 0) blk[4] &= ~0x40;
+    if (g_ctl_jump > 0) { blk[4] |= 0x20; g_ctl_jump--; }
+}
+
+/* the height of a jumper for 1.5 s after its jump, logged as one line (ms after the jump : metres above the start);
+ * 0 = the local player, 1 = the body */
+static struct { DWORD t0; int on, len; float z0; char buf[900]; } g_ztr[2];
+
+static void ztrace(int k, DWORD now, float z, int start)
+{
+    static const char *who[2] = { "local player", "body" };
+    if (start) {
+        if (g_ztr[k].on) logf_("jump trace %s:%s", who[k], g_ztr[k].buf);
+        g_ztr[k].t0 = now; g_ztr[k].on = 1; g_ztr[k].len = 0; g_ztr[k].z0 = z; g_ztr[k].buf[0] = 0;
+    }
+    if (!g_ztr[k].on) return;
+    if (now - g_ztr[k].t0 > 1500) { g_ztr[k].on = 0; logf_("jump trace %s:%s", who[k], g_ztr[k].buf); return; }
+    if (g_ztr[k].len < (int)sizeof g_ztr[k].buf - 16)
+        g_ztr[k].len += sprintf(g_ztr[k].buf + g_ztr[k].len, " %lu:%.2f", now - g_ztr[k].t0, z - g_ztr[k].z0);
+}
+
+/* the body copies the peer's crouch and sprint, and its jumps (it rises, without the jump animation) */
+static void body_apply(BYTE *pd)
+{
+    BYTE *blk = pd + 0x140;
+    *(int *)(blk + 0xa4) = g_body_crouch;
+    if (g_body_sprint) blk[4] |= 0x40;
+    else blk[4] &= ~0x40;
+    if (g_body_jump > 0) { blk[4] |= 0x20; g_body_jump--; }
+}
+
+/* a jump of the local player: the jump bit coming on, at most one per 300 ms (one jump can set it twice) */
+static void jump_watch(BYTE *pd)
+{
+    static DWORD last;
+    int on = (pd[0x140 + 4] & 0x20) != 0;
+    if (on && !g_jump_held && GetTickCount() - last >= 300) { InterlockedIncrement(&g_jumps); last = GetTickCount(); }
+    g_jump_held = on;
+}
+
 static void __attribute__((thiscall)) h_pawnupd(void *pd, void *a, void *b)
 {
+    if (pd && pd == g_ctl_pd) ctl_apply(pd);
+    if (pd && pd == g_body_pd) body_apply(pd);
+    if (pd && pd == g_net_pd) jump_watch(pd);
     o_pawnupd(pd, a, b);
+    if (pd && pd == g_ctl_pd) ctl_apply(pd);
+    if (pd && pd == g_body_pd) body_apply(pd);
     if (pd && pd == g_aim_pd) {
         BYTE *blk = g_aim_pd + 0x140;
         blk[4] |= (BYTE)g_aim_or4; blk[6] |= (BYTE)g_aim_or6; blk[7] |= (BYTE)g_aim_or7;
@@ -1331,6 +1391,33 @@ static void pawn_aim_at(unsigned long long id, unsigned long long marker, const 
  * wfire <pawn> <dx dy dz>: one bullet along that direction | wmute <pawn|0>: drop that pawn's own bullets |
  * wshoot <pawn> [8|10|11]: call the held strategy's Fire (default), StartShoot or StopShoot | wevent <pawn> <name>: hand it an
  * animation event */
+/* ctl <pawn> crouch 0|1|-1 | ctl <pawn> sprint 0|1|-1 | ctl <pawn> jump [updates] | ctl 0 (-1 = leave to the game) |
+ * ctl jumpfor <updates>: how many updates a jump holds the bit (also the body's synced jumps) */
+static int ctl_cmd(const char *ln)
+{
+    unsigned long long id;
+    char what[16];
+    int v = 0;
+    void *holder = NULL, *pc;
+    BYTE *ent;
+    if (sscanf(ln, "ctl jumpfor %d", &v) == 1) { g_jump_updates = v; logf_("ctl: jumps hold the bit for %d update(s)", v); return 1; }
+    if (strcmp(ln, "ctl 0") == 0) { g_ctl_pd = NULL; g_ctl_crouch = g_ctl_sprint = -1; g_ctl_jump = 0; logf_("ctl: off"); return 1; }
+    if (sscanf(ln, "ctl %llu %15s %d", &id, what, &v) < 2) return 0;
+    ent = entity_obj(id, &holder);
+    pc = ent ? pawn_comp(ent) : NULL;
+    if (!pc) logf_("ctl %llu: no pawn", id);
+    else {
+        BYTE *pd = *(BYTE **)((BYTE *)pc + 0x10), *blk = pd + 0x140;
+        if (pd != g_ctl_pd) { g_ctl_crouch = g_ctl_sprint = -1; g_ctl_jump = 0; g_ctl_pd = pd; }
+        if (!strcmp(what, "crouch")) g_ctl_crouch = v;
+        else if (!strcmp(what, "sprint")) g_ctl_sprint = v;
+        else if (!strcmp(what, "jump")) g_ctl_jump = v > 0 ? v : g_jump_updates;
+        logf_("ctl %llu: pawn data %p %s %d (block +4 %08x +0x8c %d +0xa4 %d)", id, pd, what, v, *(unsigned *)(blk + 4), *(int *)(blk + 0x8c), *(int *)(blk + 0xa4));
+    }
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    return 1;
+}
+
 static int wpn_cmd(const char *ln)
 {
     unsigned long long id, wid;
@@ -1339,6 +1426,7 @@ static int wpn_cmd(const char *ln)
     BYTE *ent, *mgr, *m;
     int op, on, slot = 8;
     float fd[3];
+    if (strncmp(ln, "ctl ", 4) == 0) return ctl_cmd(ln);
     if (sscanf(ln, "wfire %llu %f %f %f", &id, &fd[0], &fd[1], &fd[2]) == 4) { op = 7; wid = id; }
     else if (strcmp(ln, "waim 0") == 0) { g_aim_pd = NULL; g_aim_holder = NULL; logf_("waim: off"); return 1; }
     else if (sscanf(ln, "waimat %llu %llu", &id, &wid) == 2) { op = 10; g_aim_or4 = 0x03; g_aim_or6 = 0x84; g_aim_or7 = 0x00; }
@@ -1483,13 +1571,15 @@ static void hold_tick(void)
 #pragma pack(push, 1)
 /* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
  * weapon in the sender's hand ("" for none); shots: bullets and rockets the sender fired so far; aim: direction of the
- * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims, NET_FLAME while its flamethrower burns; look: camera direction */
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; } NetPkt;
+ * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims, NET_FLAME while its flamethrower burns, NET_CROUCH / NET_SPRINT while its player crouches / sprints; look: camera direction; jumps: jumps the sender's player made so far */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; unsigned jumps; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x38324346u
+#define NET_MAGIC 0x39324346u
 #define NET_DEAD 1u
 #define NET_AIMING 2u
 #define NET_FLAME 4u
+#define NET_CROUCH 8u
+#define NET_SPRINT 16u
 /* the local player's control block (pawn data + 0x140): bit 0x08 of byte +4 is on while aiming, +0x38 is the camera's
  * pitch and +0x40 the yaw of the matrix's local X, in radians */
 static void net_read_aim(NetPkt *p, BYTE *obj)
@@ -1654,7 +1744,13 @@ static DWORD g_ai_lastwpn;
 static unsigned g_ai_shots, g_ai_pend, g_ai_fired;
 static int g_ai_shots_on;
 static DWORD g_ai_lastshot, g_ai_lastkeep;
-static int g_ai_flaming;
+static int g_ai_flaming, g_ai_jumps_on;
+static unsigned g_ai_jumps;
+/* the peer's jumps still to make: where it jumped and when; the body jumps on reaching the spot, or late */
+#define AI_JUMPQ 3
+static struct { float pos[3]; DWORD t; } g_ai_jumpq[AI_JUMPQ];
+static int g_ai_njump;
+static DWORD g_ai_lastjump;
 static void ai_weapons_clear(void);
 
 static void ai_vehicle_release(void)
@@ -1758,6 +1854,8 @@ static void ai_weapons_clear(void)
     for (k = 0; k < 4; k++) { remove_entity(g_ai_wid[k]); g_ai_wid[k] = 0; g_ai_warch[k][0] = 0; }
     g_ai_wpn[0] = 0;
     g_ai_flaming = 0;
+    g_body_pd = NULL;
+    g_ai_njump = 0;
 }
 
 /* once a second while the body's weapon differs from the peer's: spawn the peer's weapon (once per category),
@@ -1852,6 +1950,29 @@ static void ai_held(DWORD now)
     unsigned long long held;
     pc = ent ? pawn_comp(ent) : NULL;
     if (!pc) goto done;
+    /* the peer's stance and jumps, written into the body's control block on each of its updates */
+    {
+        unsigned dj = g_remote.jumps - g_ai_jumps;
+        g_body_crouch = (g_remote.flags & NET_CROUCH) != 0;
+        g_body_sprint = (g_remote.flags & NET_SPRINT) != 0;
+        float bp[3];
+        if (g_ai_jumps_on && dj && dj < 100) {
+            if (g_ai_njump == AI_JUMPQ) { memmove(g_ai_jumpq, g_ai_jumpq + 1, sizeof g_ai_jumpq[0] * (AI_JUMPQ - 1)); g_ai_njump--; }
+            memcpy(g_ai_jumpq[g_ai_njump].pos, g_remote.pos, 12); g_ai_jumpq[g_ai_njump].t = now; g_ai_njump++;
+        }
+        g_ai_jumps = g_remote.jumps; g_ai_jumps_on = 1;
+        g_body_pd = *(BYTE **)((BYTE *)pc + 0x10);
+        if (g_ztr[1].on && ent_pos(g_ai_id, bp)) ztrace(1, now, bp[2], 0);
+        if (g_ai_njump && now - g_ai_lastjump >= 900 && ent_pos(g_ai_id, bp)) {
+            float dx = bp[0] - g_ai_jumpq[0].pos[0], dy = bp[1] - g_ai_jumpq[0].pos[1], d = sqrtf(dx * dx + dy * dy);
+            if (d < 1.2f || now - g_ai_jumpq[0].t > 1500) {
+                g_body_jump = g_jump_updates; g_ai_lastjump = now;
+                ztrace(1, now, bp[2], 1);
+                logf_("ai: body jumps %.1f m from the peer's spot, %lu ms after (peer jump %u)", d, now - g_ai_jumpq[0].t, g_remote.jumps);
+                memmove(g_ai_jumpq, g_ai_jumpq + 1, sizeof g_ai_jumpq[0] * (AI_JUMPQ - 1)); g_ai_njump--;
+            }
+        }
+    }
     held = held_weapon_id(ent);
     if (same && held && now - g_ai_lastkeep >= 2000 && now - g_ai_lastwpn >= 2000) {
         int ours = 0;
@@ -2313,6 +2434,12 @@ static void net_tick(void)
     }
     if (g_nstates == 0 || GetCurrentThreadId() != g_states[0].thread) return;
     now = GetTickCount();
+    if (g_bodymat && !IsBadReadPtr(g_bodymat, 0x40)) {
+        static LONG seen;
+        int start = g_jumps != seen;
+        seen = g_jumps;
+        ztrace(0, now, *(float *)(g_bodymat + 0x38), start);
+    }
     if (g_net_cfg == 1) {
         WSADATA wd;
         struct sockaddr_in a;
@@ -2421,6 +2548,14 @@ static void net_tick(void)
         memcpy(p.aim, g_aim_dir, sizeof p.aim);
         p.flags = g_gameover ? NET_DEAD : 0;
         net_read_aim(&p, obj);
+        {
+            void *mpc = obj ? pawn_comp(obj) : NULL;
+            BYTE *pd = mpc ? *(BYTE **)((BYTE *)mpc + 0x10) : NULL;
+            g_net_pd = pd;
+            if (pd && *(int *)(pd + 0x140 + 0xa4)) p.flags |= NET_CROUCH;
+            if (pd && (pd[0x140 + 4] & 0x40)) p.flags |= NET_SPRINT;
+            p.jumps = (unsigned)g_jumps;
+        }
         if (g_flame) {  /* a weapon switch may not pass through StopShoot */
             void *fpc = obj ? pawn_comp(obj) : NULL, *fs = fpc ? held_strategy(fpc) : NULL;
             if (!fs || *(BYTE **)fs != g_base + RVA_FLAMESTRAT_VT) { g_flame = 0; logf_("net: local flamethrower off (no longer in hand)"); }

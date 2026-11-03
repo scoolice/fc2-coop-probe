@@ -93,6 +93,7 @@ Lua is 4.0: use `foreach`, `getn`, `..`; there is no `#`. Status 0 is success, 1
 | `sig <pawn> <name\|0xhash>` | Send a signal (crc32 of its name) to the pawn's state driver, as the player's input does (`config/inputactionmapcommon.xml`: `startshooting`, `reload`, `jump`, ...). On an AI pawn `startshooting` does nothing |
 | `wbullet <pawn> [entity]` | Fire one bullet from the gun in the pawn's hand: a `shootbullet` animation event handed to its bullet fire strategy. The bullet follows the pawn's aim |
 | `wfire <pawn> <dx> <dy> <dz>` | Like `wbullet`, along the given direction (test: the buddy's bullets do damage enemies) |
+| `ctl <pawn> crouch\|sprint 0\|1\|-1` / `ctl <pawn> jump [updates]` / `ctl jumpfor <updates>` / `ctl 0` | Test: write the player's movement fields into one pawn's control block before and after each of its updates: crouch (+0xa4), sprint (+4 bit 0x40), jump (+4 bit 0x20 for a few updates; `ctl jumpfor` sets how many, default 6, also for the body's synced jumps). -1 leaves the field to the game |
 | `wshoot <pawn> [8\|10\|11]` / `wevent <pawn> <name>` | Test, any weapon type: call the held fire strategy's Fire (slot 8, default), StartShoot (slot 10) or StopShoot (slot 11); hand it an animation event such as `attach_projectile`. Both log the strategy's vtable and, for a projectile weapon, its loaded round |
 | `wmute <pawn\|0>` | Test: that pawn's gun does not fire on its own: its weapon manager's fire-one-shot step (Dunia+0x1305f0) and start-shooting step are skipped and any own bullet is dropped (only `wbullet`/`wfire` and the peer's synced shots go out). Logs its AI state changes and the call path of its first 3 own bullets. 0 turns it off |
 | `wmutebit <n>` | Test: never set bit `n` of the muted pawn's AI state mask (-1 = none). Bit 0x32 follows its bursts but holding it does not stop the firing |
@@ -287,9 +288,13 @@ Two copies, the player of A driving the save's Datsun for 25 s: the buddy in B g
 seat with its animation 1.0 s after A got in, and B's Datsun stayed a median 0.22 m (max 0.39 m while
 driving) from A's.
 
+### Crouch, sprint and jumps
+
+Packet magic `FC29`. The player's movement keys end in the pawn's control block (pawn data + 0x140; the input action dispatcher Dunia+0x144760): crouch toggles +0xa4, jump sets +4 bit 0x20, sprint +4 bit 0x40. The sender sends its crouch and sprint state as flags and counts its jumps (the jump bit coming on, seen in the pawn-update hook). The body's copy writes the same fields into the body's control block before and after each of its updates. A jump is queued with the peer's position and made when the body comes within 1.2 m of it (or 1.5 s late), at most one per 0.9 s so that it has landed; the sender counts at most one jump per 0.3 s. An AI pawn crouches and rises on a jump this way, but plays no jump animation. `ctl` does the same by hand on any pawn.
+
 ### Rockets and flame
 
-Packet magic `FC28`. Rockets count as shots: the sender counts a launch (the projectile strategy's Fire, slot 8), and the body calls the same slot on its launcher, which it holds raised along the peer's camera direction. Flame is a packet flag: the body's flame strategy gets StartShoot (slot 10) when the flag comes on and StopShoot (slot 11) when it goes off or the peer's weapon changes. An aim order makes a pawn draw the weapon it finds best (a rifle over a launcher), so the body carries only the peer's current weapon: the others are taken away on each switch. A weapon of its own it draws anyway (Frank_Bilders_Unarmed has one) is removed too.
+Rockets count as shots: the sender counts a launch (the projectile strategy's Fire, slot 8), and the body calls the same slot on its launcher, which it holds raised along the peer's camera direction. Flame is a packet flag: the body's flame strategy gets StartShoot (slot 10) when the flag comes on and StopShoot (slot 11) when it goes off or the peer's weapon changes. An aim order makes a pawn draw the weapon it finds best (a rifle over a launcher), so the body carries only the peer's current weapon: the others are taken away on each switch. A weapon of its own it draws anyway (Frank_Bilders_Unarmed has one) is removed too.
 
 Called by hand on one copy, a Frank fired 4 RPG-7 rockets and burned and stopped an LPO-50. Known gap: after its first rocket, none shows in his tube; the shots still go out.
 
