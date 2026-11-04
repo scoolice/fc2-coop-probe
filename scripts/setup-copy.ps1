@@ -19,7 +19,8 @@ Does not touch the real install, the real profile or the real saves.
      With DXVK (-Dxvk, default the dxvk folder get-dxvk.ps1 makes, used when it exists) its 32-bit d3d10core, d3d11,
      dxgi and d3d9 DLLs go into bin as well
   5. creates Documents\My Games\FC2test_<letter> with GamerProfile.xml and Saved Games\<save>.sav from -PrivateDir
-     (a GamerProfile.xml and the one .sav both PCs load; keep these private)
+     (a GamerProfile.xml and the one .sav both PCs load; keep these private). Run again: the profile's
+     GamerProfile.xml is kept, and a changed save is backed up and replaced by the shared one
 
   powershell -ExecutionPolicy Bypass -File setup-copy.ps1 -Letter B -PrivateDir <folder with GamerProfile.xml and the .sav>
 #>
@@ -158,9 +159,18 @@ if (Test-Path (Join-Path $Dxvk 'd3d11.dll')) {
 $pdir = Join-Path $Documents "My Games\$name"
 $sdir = Join-Path $pdir 'Saved Games'
 New-Item -ItemType Directory -Force $sdir | Out-Null
-foreach ($pair in @(@{ src = $prof; dst = (Join-Path $pdir 'GamerProfile.xml') }, @{ src = $saves[0].FullName; dst = (Join-Path $sdir $saves[0].Name) })) {
-    if ((Test-Path $pair.dst) -and (Get-FileHash $pair.dst).Hash -ne (Get-FileHash $pair.src).Hash) { throw "$($pair.dst) exists and differs; not overwriting" }
-    Copy-Item $pair.src $pair.dst -Force
+# an existing GamerProfile.xml is kept (it holds the tester's resolution); the save is put back to the shared one,
+# which both PCs must load, and a save the game has changed since is kept in <profile>\save-backups
+$dprof = Join-Path $pdir 'GamerProfile.xml'
+if (Test-Path $dprof) { Say 'GamerProfile.xml already in the test profile, kept as it is' } else { Copy-Item $prof $dprof }
+$dsave = Join-Path $sdir $saves[0].Name
+if ((Test-Path $dsave) -and (Get-FileHash $dsave).Hash -ne (Get-FileHash $saves[0].FullName).Hash) {
+    $bdir = Join-Path $pdir 'save-backups'
+    New-Item -ItemType Directory -Force $bdir | Out-Null
+    $bak = Join-Path $bdir ("{0:yyyyMMdd-HHmmss}-{1}" -f (Get-Date), $saves[0].Name)
+    Move-Item $dsave $bak
+    Say "the save had changed since; kept it as $bak and put the shared save back"
 }
+Copy-Item $saves[0].FullName $dsave -Force
 Say "test profile ready: $pdir (save $($saves[0].Name))"
 Say "done. Test copy: $TestDir"

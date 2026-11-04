@@ -159,11 +159,15 @@ it); everything else increments `drop`. The PCs must reach each other: same LAN,
 open to anyone who can reach it (only the peer's packets are used). Tested so far only with both
 copies on one PC, sending to that PC's own LAN address.
 
-### Through Steam, without IP addresses: `relay/fc2_relay.py`
+### Through Steam, without IP addresses: `relay/fc2_relay.c` / `relay/fc2_relay.py`
 
 A relay next to each game copy carries the probe's packets, so friends don't need IPs or port
 forwarding. The probe talks only to its local relay: `netstart <game port> 127.0.0.1 <relay port> <id>`.
-Python 3, 64-bit; the Steam transport also needs the Steam client running and `steam_api64.dll`
+`relay/fc2_relay.c` builds a 64-bit `fc2_relay.exe` with the same flags, frames and log lines, so testers need no
+Python (MSYS2 mingw64: `gcc -O2 -Wall -o fc2_relay.exe fc2_relay.c -lws2_32 -lwinmm -static`; it imports only Windows
+DLLs and loads `steam_api64.dll` at run time). `fc2_relay.exe --check --steam-dll <dll>` loads the DLL, finds every
+function and says whether Steam runs, without logging in. `start-coop.ps1` uses the exe when it is next to it (kit)
+or in `relay\`, else `fc2_relay.py` (Python 3, 64-bit). The Steam transport needs the Steam client running and `steam_api64.dll`
 from the Steamworks.NET Standalone release 2025.164.1 (`Windows-x64/steam_api64.dll`,
 SHA-256 `eb17909a76668cf9ae0b92a618a34a50f6c73d3a6787cb4dd8ce36a8b10bfb75`; not included here).
 It runs as Steam's free "Spacewar" app (AppID 480), so friends see you as "playing Spacewar".
@@ -190,6 +194,15 @@ is a stand-in that relays over plain UDP, used by the test to run the whole chai
   patches above (checks 17 changed bytes), installs the probe, and creates `Documents\My Games\FC2test_<letter>`
   from `-PrivateDir` (one `GamerProfile.xml` and the one `.sav` both PCs load). Installs FC2JackalFix and DXVK
   too when the folders below exist.
+  Run again on an existing copy: only the probe is put in again, `GamerProfile.xml` is kept, and a save the game has
+  changed is moved to `save-backups` and replaced by the shared one.
+- `Setup.bat` / `scripts/setup.ps1 [-Role join|host] [-TestDir <copy>] [-NoDxvk] [-NoJackalFix]`: the tester's one step
+  (in the kit, next to the other scripts and a `private` folder): checks for 64-bit Python (not when the kit has
+  `fc2_relay.exe`; then it runs its `--check` instead), downloads what is missing,
+  runs `setup-copy.ps1` (the copy from the settings file, else the default) and saves the copy, Python command and role in
+  `%LOCALAPPDATA%\fc2-coop\settings.json`.
+- `Play.bat` / `scripts/play.ps1 [-Join wait|friend]`: checks that the copy has the kit's probe (SHA256SUMS.txt) and runs
+  `start-coop.ps1` with those settings, `-AiBody -TestSettings`.
 - `scripts/get-jackalfix.ps1`: downloads FC2JackalFix V1 (borderless window etc.) into `scripts\jackalfix`, hashes checked.
   With it, its ASI loader is `bin\dinput8.dll` and the probe goes in as `bin\coop_probe.asi`.
 - `scripts/get-dxvk.ps1`: downloads DXVK 3.1.1 into `scripts\dxvk`, hashes checked, and keeps the 32-bit
@@ -205,7 +218,7 @@ is a stand-in that relays over plain UDP, used by the test to run the whole chai
   `netstart`, prints the link state every 5 s, and on the join side samples the avatar's and the own player's
   position every 2 s. Kill switch on the real profile path; logs in `<copy>\coop-runs\<time>-<role>\`.
   With `-AiBody` the probe gets `aibody <-Buddy> remote` before `netstart` (the other player appears as an
-  invincible buddy, spawned again after a death or reload; the 5 s status line adds its distance, orders,
+  invincible buddy, spawned again after a death or reload; the 5 s status line adds its distance,
   teleports and spawns); `-TestSettings` switches on `ai_IgnorePlayer` and `cheat_GodMode`.
 
 Tested:

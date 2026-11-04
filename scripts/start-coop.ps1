@@ -32,8 +32,11 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $kit = $PSScriptRoot
-# the relay sits next to this script in the kit, or in ..\relay in the repository
-$relayPy = if (Test-Path (Join-Path $kit 'fc2_relay.py')) { Join-Path $kit 'fc2_relay.py' } else { Join-Path $kit '..\relay\fc2_relay.py' }
+# the relay sits next to this script in the kit, or in ..\relay in the repository: fc2_relay.exe (the C port, no
+# Python needed) when it is there, else fc2_relay.py run by -Python
+$relayDir = if (Test-Path (Join-Path $kit 'fc2_relay.*')) { $kit } else { Join-Path $kit '..\relay' }
+$relayExe = Join-Path $relayDir 'fc2_relay.exe'
+$relayPy = Join-Path $relayDir 'fc2_relay.py'
 $bin = Join-Path $TestDir 'bin'
 $log = Join-Path $bin 'coop_probe.log'
 $title = if ($Role -eq 'host') { 'A' } else { 'B' }
@@ -87,10 +90,11 @@ function Native($text) {
     WaitFor 'native consumed' 10 { -not (Test-Path $f) } | Out-Null
 }
 function StartRelay {
-    $rargs = @('-I', '-u', "`"$relayPy`"", '--transport', 'steam', '--steam-dll', "`"$SteamDll`"", '--game-port', $gamePort, '--relay-port', $relayPort)
+    $rargs = @('--transport', 'steam', '--steam-dll', "`"$SteamDll`"", '--game-port', $gamePort, '--relay-port', $relayPort)
     if ($Role -eq 'host') { $rargs += '--host'; if ($Invite) { $rargs += @('--invite', "`"$Invite`"") } } else { $rargs += @('--join', $Join) }
     $wd = Join-Path $kit 'steam-run'; New-Item -ItemType Directory -Force $wd | Out-Null
-    Start-Process $Python -ArgumentList $rargs -WorkingDirectory $wd -WindowStyle Hidden -PassThru `
+    if (Test-Path $relayExe) { $cmd = $relayExe } else { $cmd = $Python; $rargs = @('-I', '-u', "`"$relayPy`"") + $rargs }
+    Start-Process $cmd -ArgumentList $rargs -WorkingDirectory $wd -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $runDir 'relay.log') -RedirectStandardError (Join-Path $runDir 'relay.err')
 }
 
@@ -99,6 +103,7 @@ try {
     if (-not (Test-Path $SteamDll)) { throw "no $SteamDll" }
     # the relay runs in steam-run, so a relative path would point inside it
     $SteamDll = (Resolve-Path $SteamDll).Path
+    Say ("relay: " + $(if (Test-Path $relayExe) { $relayExe } else { "$Python $relayPy" }))
     # Before any Enter is pressed: the copy must have its own profile + save-list folder and that folder a save.
     # Otherwise Story Mode offers only New Story, and Enter would start a new game.
     $db = [IO.File]::ReadAllBytes((Join-Path $bin 'Dunia.dll'))
@@ -171,9 +176,9 @@ try {
             $st = Get-Content (Join-Path $runDir 'relay.log') -ErrorAction SilentlyContinue | Select-String 'stats ' | Select-Object -Last 1
             Say ("{0} | {1}" -f $(if ($net) { $net.Line -replace '^\S+ \S+ ', '' } else { 'no net line yet' }), $(if ($st) { $st.Line } else { 'no relay stats yet' }))
             if ($AiBody) {
-                $ai = LogLines | Select-String '\] ai: target .* dist (\S+) orders (\d+) tps (\d+)' | Select-Object -Last 1
+                $ai = LogLines | Select-String '\] ai: target .* dist (\S+) .*?tps (\d+)' | Select-Object -Last 1
                 $sp = @(LogLines | Select-String 'ai: body spawned').Count
-                if ($ai) { Say ("AI body: {0} m behind, {1} orders, {2} teleports, {3} spawn(s)" -f $ai.Matches[0].Groups[1].Value, $ai.Matches[0].Groups[2].Value, $ai.Matches[0].Groups[3].Value, $sp) }
+                if ($ai) { Say ("AI body: {0} m from the other player, {1} teleports, {2} spawn(s)" -f $ai.Matches[0].Groups[1].Value, $ai.Matches[0].Groups[2].Value, $sp) }
             }
             if ($relay.HasExited) { Say 'relay exited'; break }
         }
