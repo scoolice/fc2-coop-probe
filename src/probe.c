@@ -152,8 +152,12 @@ static VOID WINAPI h_ExitProcess(UINT c)
     logf_("ExitProcess(%u) caller=%p", c, __builtin_return_address(0));
     o_ExitProcess(c);
 }
+/* set when the game starts to quit: the per-frame work stops, as the engine tears its world down (asking it for
+ * the player's weapon then crashed both copies, Dunia+0x2c69b4) */
+static volatile LONG g_quitting;
 static VOID WINAPI h_PostQuitMessage(int c)
 {
+    g_quitting = 1;
     logf_("PostQuitMessage(%d) caller=%p", c, __builtin_return_address(0));
     o_PostQuitMessage(c);
 }
@@ -713,6 +717,28 @@ static void native_cmd(const char *ln)
             if (found > 2000) break;
         }
         logf_("scan done, %d hits", found);
+    } else if (sscanf(ln, "findvt %lx", &a) == 1) {
+        /* every object whose first dword is Dunia+<rva> (a C++ vtable), with its first 8 dwords */
+        MEMORY_BASIC_INFORMATION mbi;
+        BYTE *p = NULL;
+        DWORD want = (DWORD)(g_base + a);
+        int found = 0;
+        logf_("findvt %lx (%08lx)", a, want);
+        while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+            if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mbi.Protect & PAGE_GUARD) &&
+                mbi.RegionSize < 0x20000000) {
+                DWORD *q = (DWORD *)mbi.BaseAddress, *end = (DWORD *)((BYTE *)mbi.BaseAddress + mbi.RegionSize) - 8;
+                for (; q < end; q++) {
+                    if (*q != want) continue;
+                    logf_("FINDVT %p: %08lx %08lx %08lx(%.3f) %08lx(%.3f) %08lx %08lx %08lx %08lx", q, q[0], q[1], q[2], *(float *)&q[2],
+                          q[3], *(float *)&q[3], q[4], q[5], q[6], q[7]);
+                    if (++found >= 200) break;
+                }
+            }
+            p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+            if (found >= 200) break;
+        }
+        logf_("findvt done, %d found", found);
     } else if (sscanf(ln, "pokef %lx %f", &a, &fx) == 2) {
         if (IsBadWritePtr((void *)a, 4)) logf_("pokef %lx: not writable", a);
         else { *(float *)a = fx; logf_("pokef %lx = %.3f", a, fx); }
@@ -789,8 +815,90 @@ static void ent_place(BYTE *ent, const float *pos, float yaw)
     ((setvec_t)(g_base + RVA_SETPOSITION))(ent, pos[0], pos[1], pos[2]);
 }
 
+/* Havok bodies (MSVC RTTI in Dunia): hkpRigidBody vtable Dunia+0xefa204, its motion embedded in it. hkpMotion
+ * vtable slot 16 setLinearVelocity copies a vector to motion+0xd0, slot 17 setAngularVelocity to +0xe0, slot 18
+ * applyLinearImpulse adds impulse * inverse mass (+0xcc) to +0xd0; slots 11-15 work on the motion state at +0x10
+ * (its transform: rotation rows, translation at +0x40). The motion vtables of every hkp*Motion class: */
+#define RVA_HKRIGIDBODY_VT 0xefa204
+static const DWORD g_motion_vts[] = { 0xef9d8c, 0xefa5fc, 0xef9f64, 0xef9df4, 0xef9e74, 0xef9edc, 0xefa58c, 0xefa86c, 0xefac4c };
+
+static int is_motion_vt(DWORD v)
+{
+    unsigned i;
+    for (i = 0; i < sizeof g_motion_vts / sizeof g_motion_vts[0]; i++) if (v == (DWORD)(g_base + g_motion_vts[i])) return 1;
+    return 0;
+}
+
+/* the rigid bodies reachable from p in two pointer steps (dwords of the first 0x400 bytes, then of 0x200) */
+static int find_bodies(BYTE *p, BYTE **out, int max)
+{
+    int n = 0, i, j, k;
+    DWORD rb = (DWORD)(g_base + RVA_HKRIGIDBODY_VT);
+    if (!p || IsBadReadPtr(p, 0x400)) return 0;
+    for (i = 0; i < 0x400 && n < max; i += 4) {
+        BYTE *q = *(BYTE **)(p + i);
+        if ((DWORD)q < 0x10000 || IsBadReadPtr(q, 0x200)) continue;
+        if (*(DWORD *)q == rb) { for (k = 0; k < n && out[k] != q; k++) ; if (k == n) out[n++] = q; continue; }
+        for (j = 0; j < 0x200 && n < max; j += 4) {
+            BYTE *r = *(BYTE **)(q + j);
+            if ((DWORD)r < 0x10000 || IsBadReadPtr(r, 4) || *(DWORD *)r != rb) continue;
+            for (k = 0; k < n && out[k] != r; k++) ;
+            if (k == n) out[n++] = r;
+        }
+    }
+    return n;
+}
+
+/* the motion embedded in a rigid body (its vtable within the first 0x400 bytes), or NULL */
+static BYTE *body_motion(BYTE *b)
+{
+    int i;
+    if (!b || IsBadReadPtr(b, 0x400)) return NULL;
+    for (i = 4; i < 0x400; i += 4) if (is_motion_vt(*(DWORD *)(b + i))) return b + i;
+    return NULL;
+}
+
+/* the vehicle's chassis motion: the body whose motion translation is nearest the entity's position (within 3 m) */
+static BYTE *veh_motion(BYTE *ent, int log)
+{
+    BYTE *bodies[16], *best = NULL, *roots[3];
+    float *m = (float *)(ent + 0x30), bd = 9.0f;
+    int n = 0, i, r;
+    roots[0] = ent_physics(ent); roots[1] = ((getvehphys_t)(g_base + RVA_GETVEHPHYS))(ent); roots[2] = ent;
+    for (r = 0; r < 3; r++) n += find_bodies(roots[r], bodies + n, 16 - n);
+    for (i = 0; i < n; i++) {
+        BYTE *mo = body_motion(bodies[i]);
+        float *t, d;
+        if (!mo) { if (log) logf_("vbody: body %p, no motion found", bodies[i]); continue; }
+        t = (float *)(mo + 0x10 + 0x30);
+        d = (t[0] - m[12]) * (t[0] - m[12]) + (t[1] - m[13]) * (t[1] - m[13]) + (t[2] - m[14]) * (t[2] - m[14]);
+        if (log) logf_("vbody: body %p motion %p (+0x%x, vtable rva %lx) pos %.2f %.2f %.2f vel %.2f %.2f %.2f ang %.2f %.2f %.2f invmass %.4f",
+                       bodies[i], mo, (unsigned)(mo - bodies[i]), (unsigned long)(*(BYTE **)mo - g_base), t[0], t[1], t[2],
+                       *(float *)(mo + 0xd0), *(float *)(mo + 0xd4), *(float *)(mo + 0xd8),
+                       *(float *)(mo + 0xe0), *(float *)(mo + 0xe4), *(float *)(mo + 0xe8), *(float *)(mo + 0xcc));
+        if (d < bd) { bd = d; best = mo; }
+    }
+    if (log) logf_("vbody: %d bodies, entity pos %.2f %.2f %.2f, chassis motion %p", n, m[12], m[13], m[14], best);
+    return best;
+}
+
+/* vin (vehicle input, h_vehinput below) */
+static BYTE *g_vin_veh;          /* the vehicle object whose input is replaced */
+static BYTE g_vin_rec[12];       /* its record */
+static int g_vin_log;            /* vin log: log the next vehicles seen */
+
+/* The physics component (vtable Dunia+0xe13360 on a vehicle) passes these on to each of its physics objects
+ * (array at +0x60, count +0x64): slot 41 (+0xa4, RET 0xc) takes a vector by value, apparently set linear velocity;
+ * slot 42 (+0xa8, RET 4) fills a vector, apparently get it; slot 43 (+0xac) a call without arguments, apparently
+ * wake; slot 44 (+0xb0) a bool, apparently awake. vpc tests them. */
+typedef void (__attribute__((thiscall)) *physvec_t)(void *phys, float x, float y, float z);
+typedef float *(__attribute__((thiscall)) *physget_t)(void *phys, float *out);
+typedef void (__attribute__((thiscall)) *physvoid_t)(void *phys);
+typedef unsigned char (__attribute__((thiscall)) *physbool_t)(void *phys);
+
 /* vinfo <id> | vphys <id> 0|1 | vset <id> <x> <y> <z> <yaw radians> | getc <id> <getter rva hex>: calls a
- * GetComponent<T> getter (thiscall on the entity, e.g. 90930 = CPawnNetworkComponent) and logs the component */
+ * GetComponent<T> getter (thiscall on the entity, e.g. 90930 = CPawnNetworkComponent) and logs the component |
+ * vbody <id>: its Havok bodies and chassis motion | vvel <id> <vx> <vy> <vz>: set the chassis' linear velocity once */
 static int veh_cmd(const char *ln)
 {
     unsigned long long id;
@@ -807,6 +915,51 @@ static int veh_cmd(const char *ln)
             c = ((getvehphys_t)(g_base + rva))(ent);
             logf_("getc %llu %lx: entity %p vtable rva %lx -> component %p vtable rva %lx", id, rva, ent,
                   (unsigned long)(*(BYTE **)ent - g_base), c, c && !IsBadReadPtr(c, 4) ? (unsigned long)(*(BYTE **)c - g_base) : 0UL);
+        }
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        return 1;
+    }
+    if (strncmp(ln, "vin", 3) == 0 && (ln[3] == ' ' || !ln[3])) {
+        unsigned long va;
+        float th, st;
+        int hb, rv = 0;
+        if (strcmp(ln, "vin log") == 0) { g_vin_log = 4; return 1; }
+        if (strcmp(ln, "vin off") == 0) { g_vin_veh = NULL; logf_("vin: off"); return 1; }
+        if (sscanf(ln, "vin %lx %f %f %d %d", &va, &th, &st, &hb, &rv) >= 4) {
+            memset(g_vin_rec, 0, sizeof g_vin_rec);
+            *(float *)g_vin_rec = th; g_vin_rec[4] = (BYTE)hb; g_vin_rec[5] = (BYTE)rv; *(float *)(g_vin_rec + 8) = st;
+            g_vin_veh = (BYTE *)va;
+            logf_("vin: vehicle %p gets throttle %.2f steer %.2f handbrake %d", g_vin_veh, th, st, hb);
+            return 1;
+        }
+        return 0;
+    }
+    if (strncmp(ln, "vpc ", 4) == 0) {
+        char what[8] = "";
+        void *phys, **vt;
+        float o[4] = { 0 };
+        if (sscanf(ln, "vpc %llu %7s %f %f %f", &id, what, &v[0], &v[1], &v[2]) < 2) return 0;
+        ent = entity_obj(id, &holder);
+        phys = ent && !IsBadReadPtr(ent, 0x70) ? ent_physics(ent) : NULL;
+        if (!phys) logf_("vpc %llu: no physics component", id);
+        else {
+            vt = *(void ***)phys;
+            if (!strcmp(what, "set")) ((physvec_t)vt[41])(phys, v[0], v[1], v[2]);
+            else if (!strcmp(what, "wake")) ((physvoid_t)vt[43])(phys);
+            ((physget_t)vt[42])(phys, o);
+            logf_("vpc %llu %s: physics %p (vtable rva %lx) velocity %.2f %.2f %.2f awake %d", id, what, phys,
+                  (unsigned long)((BYTE *)vt - g_base), o[0], o[1], o[2], ((physbool_t)vt[44])(phys));
+        }
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        return 1;
+    }
+    if (sscanf(ln, "vbody %llu", &id) == 1 || sscanf(ln, "vvel %llu %f %f %f", &id, &v[0], &v[1], &v[2]) == 4) {
+        BYTE *mo;
+        ent = entity_obj(id, &holder);
+        if (!ent || IsBadReadPtr(ent, 0x70)) logf_("vbody %llu: no entity", id);
+        else if ((mo = veh_motion(ent, ln[1] == 'b')) && ln[1] == 'v') {
+            *(float *)(mo + 0xd0) = v[0]; *(float *)(mo + 0xd4) = v[1]; *(float *)(mo + 0xd8) = v[2];
+            logf_("vvel %llu: motion %p velocity set to %.2f %.2f %.2f", id, mo, v[0], v[1], v[2]);
         }
         if (holder) (*(int *)((BYTE *)holder + 8))--;
         return 1;
@@ -1364,6 +1517,115 @@ static void __attribute__((thiscall)) h_flamestop(void *strat, void *pc)
     o_flamestop(strat, pc);
 }
 
+/* The game's vehicle input step, FUN_104ac570 (thiscall (vehicle, step), RET 4; vtable entry Dunia+0xe67338): it asks the
+ * driver's controller (*(*(vehicle + 0xd4) + 0x180), vtable +0x134) for its input record (float +0 throttle, byte +4
+ * handbrake, byte +5 reverse, float +8 steering), turns it into the Havok driver input status at *(vehicle + 0x9c)
+ * (+8 steering X, +0xc throttle Y = -record throttle, both clamped to -1..1, +0x10 handbrake, +0x11 reverse = byte +5
+ * and throttle above 0.1) and runs the vehicle step. On the physics thread, once per step. h_vehinput writes a record of ours into the controller's before it for one
+ * vehicle (and puts the controller's back after), and keeps the last record of each vehicle it saw. */
+#define RVA_VEHINPUT_VT 0xe67338
+#define RVA_VEHINPUT 0x4ac570
+typedef void (__attribute__((thiscall)) *vehinput_t)(void *veh, void *step);
+typedef BYTE *(__attribute__((thiscall)) *vehrec_t)(void *ctl);
+static vehinput_t o_vehinput;
+#define VIN_SEEN 16
+static struct { BYTE *veh; BYTE rec[12]; DWORD t; } g_vin_seen[VIN_SEEN];
+
+/* the chassis motion of a vehicle instance: its chassis rigid body (hkpUnaryAction entity, instance + 0x18) holds
+ * its motion at +0xd0: position at motion + 0x40, rotation columns at +0x10/+0x20/+0x30 (+0x20 = forward, local Y),
+ * linear velocity +0xd0, angular velocity +0xe0 */
+static BYTE *inst_motion(BYTE *inst)
+{
+    BYTE *b;
+    if (!inst || IsBadReadPtr(inst + 0x18, 4) || !(b = *(BYTE **)(inst + 0x18)) || IsBadReadPtr(b, 0x1c0)) return NULL;
+    if (*(DWORD *)b != (DWORD)(g_base + RVA_HKRIGIDBODY_VT) || !is_motion_vt(*(DWORD *)(b + 0xd0))) return NULL;
+    return b + 0xd0;
+}
+
+/* the vehicle instance seen in the last second whose chassis is nearest pos (within 3 m), or -1 */
+static int veh_instance(const float *pos)
+{
+    int i, best = -1;
+    float bd = 9.0f;
+    DWORD now = GetTickCount();
+    for (i = 0; i < VIN_SEEN; i++) {
+        BYTE *mo;
+        float *q, d;
+        if (!g_vin_seen[i].veh || now - g_vin_seen[i].t > 1000 || !(mo = inst_motion(g_vin_seen[i].veh))) continue;
+        q = (float *)(mo + 0x40);
+        d = (q[0] - pos[0]) * (q[0] - pos[0]) + (q[1] - pos[1]) * (q[1] - pos[1]) + (q[2] - pos[2]) * (q[2] - pos[2]);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+/* the body's copy of the peer's vehicle is driven by the peer's input; each physics step its velocity and yaw rate
+ * also move VT_A of the way toward the peer's, plus VT_K (per second) of the position error (at most VT_MAXC m/s)
+ * and VT_KYAW of the heading error. g_vt_* are set from the packets on the main thread. */
+#define VT_A 0.15f
+#define VT_K 1.5f
+#define VT_MAXC 5.0f
+#define VT_KYAW 2.0f
+static volatile int g_vt_on;
+static float g_vt_pos[3], g_vt_vel[3], g_vt_fwd[2], g_vt_wz;
+static volatile DWORD g_vt_t;
+
+static void vt_correct(BYTE *mo)
+{
+    float *x = (float *)(mo + 0x40), *v = (float *)(mo + 0xd0), *w = (float *)(mo + 0xe0), *fw = (float *)(mo + 0x20);
+    float age = (GetTickCount() - g_vt_t) / 1000.0f, ex, ey, e, cx, cy, yaw;
+    if (age > 0.3f) age = 0.3f;
+    ex = g_vt_pos[0] + g_vt_vel[0] * age - x[0]; ey = g_vt_pos[1] + g_vt_vel[1] * age - x[1];
+    cx = ex * VT_K; cy = ey * VT_K; e = sqrtf(cx * cx + cy * cy);
+    if (e > VT_MAXC) { cx *= VT_MAXC / e; cy *= VT_MAXC / e; }
+    v[0] += (g_vt_vel[0] + cx - v[0]) * VT_A; v[1] += (g_vt_vel[1] + cy - v[1]) * VT_A;
+    yaw = atan2f(fw[0] * g_vt_fwd[1] - fw[1] * g_vt_fwd[0], fw[0] * g_vt_fwd[0] + fw[1] * g_vt_fwd[1]);
+    w[2] += (g_vt_wz + yaw * VT_KYAW - w[2]) * VT_A;
+}
+
+static BYTE *veh_record(BYTE *veh)
+{
+    BYTE *a, *ctl;
+    if (IsBadReadPtr(veh + 0xd4, 4) || !(a = *(BYTE **)(veh + 0xd4)) || IsBadReadPtr(a + 0x180, 4)) return NULL;
+    if (!(ctl = *(BYTE **)(a + 0x180)) || IsBadReadPtr(ctl, 4) || IsBadReadPtr(*(BYTE **)ctl + 0x134, 4)) return NULL;
+    return ((vehrec_t)(*(void ***)ctl)[0x134 / 4])(ctl);
+}
+
+static void __attribute__((thiscall)) h_vehinput(void *veh, void *step)
+{
+    BYTE *rec = veh_record(veh), keep[12];
+    int i, swap = rec && veh == g_vin_veh;
+    if (rec) {
+        for (i = 0; i < VIN_SEEN && g_vin_seen[i].veh && g_vin_seen[i].veh != veh && GetTickCount() - g_vin_seen[i].t < 5000; i++) ;
+        if (i == VIN_SEEN) i = VIN_SEEN - 1;
+        g_vin_seen[i].veh = veh; memcpy(g_vin_seen[i].rec, rec, 12); g_vin_seen[i].t = GetTickCount();
+        if (g_vin_log > 0) {
+            g_vin_log--;
+            logf_("vin: vehicle %p record %p throttle %.2f handbrake %d reverse %d steer %.2f status %p", veh, rec, *(float *)rec, rec[4], rec[5],
+                  *(float *)(rec + 8), *(void **)((BYTE *)veh + 0x9c));
+        }
+    }
+    if (swap) {
+        BYTE *mo;
+        memcpy(keep, rec, 12); memcpy(rec, g_vin_rec, 12);
+        if (g_vt_on && (mo = inst_motion(veh))) vt_correct(mo);
+    }
+    o_vehinput(veh, step);
+    if (swap) memcpy(rec, keep, 12);
+}
+
+static void install_vehicle_hooks(void)
+{
+    void **slot = (void **)(g_base + RVA_VEHINPUT_VT);
+    DWORD old;
+    if (*slot != g_base + RVA_VEHINPUT) { logf_("vehicle hook: unexpected vtable, not installed"); return; }
+    o_vehinput = (vehinput_t)*slot;
+    VirtualProtect(slot, sizeof(void *), PAGE_READWRITE, &old);
+    *slot = (void *)h_vehinput;
+    VirtualProtect(slot, sizeof(void *), old, &old);
+    logf_("vehicle input hook installed");
+}
+
 static void install_weapon_hooks(void)
 {
     void **pv = (void **)(g_base + RVA_PROJSTRAT_VT), **fv = (void **)(g_base + RVA_FLAMESTRAT_VT);
@@ -1620,10 +1882,16 @@ static void hold_tick(void)
 /* veh: the vehicle the sender is in (0 on foot), with its position and forward vector; wpn: archetype of the
  * weapon in the sender's hand ("" for none); shots: bullets and rockets the sender fired so far; aim: direction of the
  * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims, NET_FLAME while its flamethrower burns, NET_CROUCH / NET_SPRINT while its player crouches / sprints; look: camera direction; jumps: jumps the sender's player made so far;
- * mv: the sender's desired movement (control block +0xb0/+0xb4, world m/s) */
-typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; unsigned jumps; float mv[2]; } NetPkt;
+ * mv: the sender's desired movement (control block +0xb0/+0xb4, world m/s); vrec: its vehicle's driver input
+ * (throttle, steering) with vflags VEH_HANDBRAKE / VEH_REVERSE / VEH_INPUT (vrec valid); vvel, vwz: the vehicle's
+ * linear velocity and yaw rate */
+typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; unsigned jumps; float mv[2];
+                 float vrec[2]; unsigned vflags; float vvel[3]; float vwz; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x41324346u
+#define NET_MAGIC 0x42324346u
+#define VEH_HANDBRAKE 1u
+#define VEH_REVERSE 2u
+#define VEH_INPUT 4u
 #define NET_DEAD 1u
 #define NET_AIMING 2u
 #define NET_FLAME 4u
@@ -1824,6 +2092,7 @@ static void ai_vehicle_release(void)
 {
     void *holder = NULL, *phys;
     BYTE *v;
+    g_vt_on = 0; g_vin_veh = NULL;
     if (!g_ai_veh) return;
     v = entity_obj(g_ai_veh, &holder);
     if (v && (phys = ent_physics(v))) ent_set_physics(phys, 1);
@@ -2156,24 +2425,46 @@ static int ai_target(DWORD now, float *t)
     }
 }
 
+/* vdrive 1 (default): our copy of the peer's vehicle keeps its physics and is driven with the peer's input
+ * (h_vehinput), corrected toward the peer's position, velocity and heading (vt_correct), and placed again when it
+ * is VDRIVE_SNAP m off. vdrive 0: physics off, placed from the packets every frame. */
+#define VDRIVE_SNAP 6.0f
+static int g_vdrive = 1;
+static DWORD g_vdrive_snap;
+static unsigned g_vdrive_snaps;
+
+/* places a vehicle with its physics on: off, place, on, woken, given a velocity */
+static void veh_snap(BYTE *v, const float *pos, float yaw, const float *vel)
+{
+    void *phys = ent_physics(v);
+    if (phys) ent_set_physics(phys, 0);
+    ent_place(v, pos, yaw);
+    if (phys) {
+        ent_set_physics(phys, 1);
+        ((physvoid_t)(*(void ***)phys)[43])(phys);
+        ((physvec_t)(*(void ***)phys)[41])(phys, vel[0], vel[1], vel[2]);
+    }
+}
+
 /* the peer drives g_remote.veh. 0 when this world has no such vehicle (walk or glide instead) */
 static int ai_drive(DWORD now, const float *t, const float *p)
 {
     void *holder = NULL, *phys;
     BYTE *v;
-    float pos[3], lead, yaw, d;
+    float pos[3], lead, yaw, d, err = 0;
     char code[512], out[32];
     if (g_ai_veh != g_remote.veh) {
         ai_vehicle_release();
         v = entity_obj(g_remote.veh, &holder);
         phys = v && !IsBadReadPtr(v, 0x70) ? ent_physics(v) : NULL;
-        if (phys) ent_set_physics(phys, 0);
+        if (phys && !g_vdrive) ent_set_physics(phys, 0);
+        g_vdrive_snap = 0;
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (!phys) { logf_("ai: peer's vehicle %llu is not in this world, walking instead", g_remote.veh); g_ai_noveh = g_remote.veh; return 0; }
         g_ai_veh = g_remote.veh; g_ai_seated = 0; g_ai_seattries = 0; g_ai_lastseat = 0;
         snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
         lua_eval(code, out, sizeof out);
-        logf_("ai: peer entered vehicle %llu, physics off", g_ai_veh);
+        logf_("ai: peer entered vehicle %llu, %s", g_ai_veh, g_vdrive ? "driven with the peer's input" : "physics off");
     }
     v = entity_obj(g_ai_veh, &holder);
     if (!v || IsBadReadPtr(v, 0x70)) {
@@ -2183,10 +2474,33 @@ static int ai_drive(DWORD now, const float *t, const float *p)
         return 0;
     }
     lead = fminf((now - g_net_lastrx) / 1000.0f, 0.25f);
-    pos[0] = g_remote.vpos[0] + g_ai_vel[0] * lead; pos[1] = g_remote.vpos[1] + g_ai_vel[1] * lead; pos[2] = g_remote.vpos[2];
     /* the forward vector is the matrix's local +Y, hence the quarter turn (as noclip seeds its yaw) */
     yaw = atan2f(g_remote.vfwd[1], g_remote.vfwd[0]) - 1.5707963f;
-    ent_place(v, pos, yaw);
+    if (!g_vdrive) {
+        pos[0] = g_remote.vpos[0] + g_ai_vel[0] * lead; pos[1] = g_remote.vpos[1] + g_ai_vel[1] * lead; pos[2] = g_remote.vpos[2];
+        ent_place(v, pos, yaw);
+    } else {
+        float *m = (float *)(v + 0x30);
+        int k;
+        pos[0] = g_remote.vpos[0] + g_remote.vvel[0] * lead; pos[1] = g_remote.vpos[1] + g_remote.vvel[1] * lead;
+        pos[2] = g_remote.vpos[2] + g_remote.vvel[2] * lead;
+        err = sqrtf((pos[0] - m[12]) * (pos[0] - m[12]) + (pos[1] - m[13]) * (pos[1] - m[13]));
+        if ((err > VDRIVE_SNAP || !g_vdrive_snap) && now - g_vdrive_snap >= 1000) {
+            veh_snap(v, pos, yaw, g_remote.vvel);
+            g_vdrive_snap = now; g_vdrive_snaps++;
+            logf_("ai: vehicle %llu placed at the peer's (%.1f m off), snap %u", g_ai_veh, err, g_vdrive_snaps);
+        }
+        memcpy(g_vt_pos, g_remote.vpos, sizeof g_vt_pos); memcpy(g_vt_vel, g_remote.vvel, sizeof g_vt_vel);
+        memcpy(g_vt_fwd, g_remote.vfwd, sizeof g_vt_fwd); g_vt_wz = g_remote.vwz; g_vt_t = g_net_lastrx;
+        memset(g_vin_rec, 0, sizeof g_vin_rec);
+        if (g_remote.vflags & VEH_INPUT) {
+            *(float *)g_vin_rec = g_remote.vrec[0]; *(float *)(g_vin_rec + 8) = g_remote.vrec[1];
+            g_vin_rec[4] = (g_remote.vflags & VEH_HANDBRAKE) != 0; g_vin_rec[5] = (g_remote.vflags & VEH_REVERSE) != 0;
+        } else g_vin_rec[4] = 1;
+        k = veh_instance(m + 12);
+        g_vin_veh = k >= 0 ? g_vin_seen[k].veh : NULL;
+        g_vt_on = g_vin_veh != NULL;
+    }
     if (holder) (*(int *)((BYTE *)holder + 8))--;
     /* seating waits for the pawn to have loaded, as the game's VehicleRide box does; CVehicle_GetCurrentVehicle
      * on a pawn that is not there reads a null pointer (Dunia+0xe7337) */
@@ -2204,8 +2518,9 @@ static int ai_drive(DWORD now, const float *t, const float *p)
     if (now - g_ai_lastlog >= 1000) {
         g_ai_lastlog = now;
         d = sqrtf((t[0] - p[0]) * (t[0] - p[0]) + (t[1] - p[1]) * (t[1] - p[1]));
-        logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u glide %u veh %llu seated %d",
-              t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps, g_ai_glides, g_ai_veh, g_ai_seated);
+        logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u glide %u veh %llu seated %d car %.2f m off, input %s (throttle %.2f steer %.2f) snaps %u",
+              t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps, g_ai_glides, g_ai_veh, g_ai_seated, err,
+              g_vin_veh ? "replayed" : "-", g_remote.vrec[0], g_remote.vrec[1], g_vdrive_snaps);
     }
     return 1;
 }
@@ -2522,7 +2837,7 @@ static void ai_tick(void)
 
 /* aibody <archetype> <remote|local> | aifollow <pawn id> <remote|local|circle> [radius speed] | aispeed <n> |
  * aitp <metres> | aistall <ms> <metres> | ailead <seconds> | aiglide <on m/s> <off m/s> (0 = never) |
- * airescue <seconds> (0 = off) | aidrive 0|1 | aiready 0|1 | aiaim <ms> | aistop */
+ * airescue <seconds> (0 = off) | aidrive 0|1 | aiready 0|1 | aiaim <ms> | vdrive 0|1 | aistop */
 static int ai_cmd(const char *ln)
 {
     unsigned long long id;
@@ -2530,6 +2845,7 @@ static int ai_cmd(const char *ln)
     float r = 0, v = 0, p[3];
     int n;
     if (sscanf(ln, "aiaim %d", &n) == 1 && n >= 0) { g_ai_aim_ms = n; logf_("ai: aim orders at most every %d ms", n); return 1; }
+    if (sscanf(ln, "vdrive %d", &n) == 1) { g_vdrive = n; logf_("ai: vehicles %s", n ? "driven with the peer's input" : "placed every frame, physics off"); return 1; }
     if (sscanf(ln, "aiready %d", &n) == 1) { g_ai_ready = n; logf_("ai: %s", n ? "body keeps its gun up along the peer's camera" : "body aims only while the peer aims"); return 1; }
     if (sscanf(ln, "aidrive %d", &n) == 1) { g_ai_drive = n; logf_("ai: %s", n ? "driven by the peer's movement" : "MoveTo follower"); if (!n && g_ai_src) ai_order("drive off"); return 1; }
     if (sscanf(ln, "aibody %95s %15s", arch, src) == 2) {
@@ -2716,6 +3032,16 @@ static void net_tick(void)
             p.veh = g_net_veh;
             memcpy(p.vpos, obj + 0x60, sizeof p.vpos);
             p.vfwd[0] = *(float *)(obj + 0x40); p.vfwd[1] = *(float *)(obj + 0x44);
+            {
+                int k = veh_instance(p.vpos);
+                BYTE *mo = k >= 0 ? inst_motion(g_vin_seen[k].veh) : NULL;
+                if (k >= 0) {
+                    BYTE *r = g_vin_seen[k].rec;
+                    p.vrec[0] = *(float *)r; p.vrec[1] = *(float *)(r + 8);
+                    p.vflags = VEH_INPUT | (r[4] ? VEH_HANDBRAKE : 0) | (r[5] ? VEH_REVERSE : 0);
+                }
+                if (mo) { memcpy(p.vvel, mo + 0xd0, sizeof p.vvel); p.vwz = *(float *)(mo + 0xe8); }
+            }
         }
         if (holder) (*(int *)((BYTE *)holder + 8))--;
         sendto(g_ns, (char *)&p, sizeof p, 0, (struct sockaddr *)&g_peer, sizeof g_peer);
@@ -2744,8 +3070,8 @@ static void pump_main(void)
     run_cmd(g_states[0].L);
     g_busy = 0;
 }
-static BOOL WINAPI h_PeekMessageA(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); ai_tick(); pump_main(); return o_PeekMessageA(m, h, a, b, c); }
-static BOOL WINAPI h_PeekMessageW(LPMSG m, HWND h, UINT a, UINT b, UINT c) { hold_tick(); net_tick(); ai_tick(); pump_main(); return o_PeekMessageW(m, h, a, b, c); }
+static BOOL WINAPI h_PeekMessageA(LPMSG m, HWND h, UINT a, UINT b, UINT c) { if (!g_quitting) { hold_tick(); net_tick(); ai_tick(); pump_main(); } return o_PeekMessageA(m, h, a, b, c); }
+static BOOL WINAPI h_PeekMessageW(LPMSG m, HWND h, UINT a, UINT b, UINT c) { if (!g_quitting) { hold_tick(); net_tick(); ai_tick(); pump_main(); } return o_PeekMessageW(m, h, a, b, c); }
 
 static int __cdecl h_gettop(void *L)
 {
@@ -2779,6 +3105,7 @@ static void install_lua(HMODULE m)
     install_shot_hook();
     install_gameover_hook();
     install_weapon_hooks();
+    install_vehicle_hooks();
 }
 
 static DWORD WINAPI watcher(LPVOID p)

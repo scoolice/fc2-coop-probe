@@ -302,6 +302,26 @@ Two copies, the player of A driving the save's Datsun for 25 s: the buddy in B g
 seat with its animation 1.0 s after A got in, and B's Datsun stayed a median 0.22 m (max 0.39 m while
 driving) from A's.
 
+**Driven by the peer's input (packet `FC2B`, `vdrive 1`, default).** Placed with its physics off, the car floated
+and passed through things (owner). Now the receiver's car keeps its physics and Frank drives it with the peer's
+controls:
+
+- The game's vehicle input step (Dunia+0x4ac570, vtable entry +0xe67338, on the physics thread) reads the driver's
+  input record (throttle, handbrake, reverse, steering) and writes Havok's `hkpVehicleDriverInputAnalogStatus` before
+  each vehicle step. The probe hooks it: the sender keeps its own car's record; the receiver puts the peer's record
+  into the controller of its copy just before the step (and the controller's back after).
+- The Havok vehicle instance's chassis rigid body (instance + 0x18) holds its motion at +0xd0 (position +0x40,
+  forward column +0x20, linear velocity +0xd0, angular +0xe0). The sender sends its car's velocity and yaw rate; in
+  the same hook the receiver moves its car's velocity and yaw rate 15% of the way per step toward the peer's, plus
+  1.5/s of the position error (at most 5 m/s) and 2/s of the heading error.
+- Getting in, or more than 6 m off, the car is placed at the peer's (physics off, place, on, woken, given the
+  peer's velocity through the physics component's set-velocity slot).
+
+Two copies, the owner driving three times (slow, fast, turns, getting in and out): "that works great"; B's car
+stayed a median 0.16 m from A's (p90 0.74, max 0.84 m, 1 s samples), snapped only on getting in. `vdrive 0` brings
+back the placement. Test commands: `vbody`, `vpc <car> get|wake|set x y z`, `vin log|off|<instance> <throttle>
+<steer> <handbrake> [reverse]`, `findvt <vtable rva>` (every object with that vtable).
+
 ### Driven legs
 
 Packet magic `FC2A`. The player's movement code ends by writing its desired movement into the control block (+0xb0/+0xb4/+0xb8, world m/s; FUN_10143de0), and the pawn's locomotion follows it with its own walk, run and sprint animations; an AI pawn does too (one copy, `ctl <Frank> move`: 1.5 m/s walked at ~1.5, 3.8 ran at ~3.6, 7.9 sprinted at ~7.4, stopping within 0.7 m). The sender sends its own; the body's copy, on foot, writes the peer's movement plus a pull toward the peer's position (1.2 per second, at most 4 m/s) into the body's block on each update, and holds MoveTo (`MoveToStopped` instead). The 10 m teleport, the glide and the vehicle seat stay; on foot the glide starts only above 12 m/s (a sprint's first burst is 8.9 m/s, above the default `aiglide` 8). The sprint flag is the write block's bit (set by the key) or the read block's (+0x2d0, kept by the movement code for the rest of the sprint). `aidrive 0` goes back to the MoveTo follower.
