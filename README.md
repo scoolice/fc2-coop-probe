@@ -322,6 +322,27 @@ stayed a median 0.16 m from A's (p90 0.74, max 0.84 m, 1 s samples), snapped onl
 back the placement. Test commands: `vbody`, `vpc <car> get|wake|set x y z`, `vin log|off|<instance> <throttle>
 <steer> <handbrake> [reverse]`, `findvt <vtable rva>` (every object with that vtable).
 
+**Seats (packet `FC2C`).** Each packet carries the sender's seat in its vehicle and the seat's type. A vehicle's
+seats are found as `BindToVehicleRide` finds them: its `CAIComponent` (tag Dunia+0xfe4090) holds a seat manager
+at +0x14, and the seats are `{ pointer, count }` at `*(*(manager + 0x210) + 0x10) + 0xc`, 0x50 bytes each (+0x10
+type: 1 driver, 2 gunner, 3 passenger; +0x28 the occupant's entity id). Rover with a mounted gun: seat 0 driver,
+1 passenger, 2 the gun; Datsun: 0 standing in the back, 1 driver. The peer driving: the body is seated with
+`SetupVehicleFollowPath` and the car is driven with the peer's input as above. Any other seat: the body is put there
+with `BindToVehicleRide(vehicle, body, seat)`, and the car moves the way the receiving world drives it (riding in
+the local player's car is allowed now, unless both drive). A seat change seats the body again.
+
+A vehicle spawned during play (patrols, test spawns) has another id in each world. The receiver then takes the
+nearest entity with seats within 8 m of the peer's vehicle: a thread reads all memory for entities there (vtable
+Dunia+0xe6b464, id at +8, position +0x60; about 1.5 s, `ReadProcessMemory` on our own process so a page freed
+meanwhile only fails the read), and the main thread checks which has seats (`vmap x y z` runs it once and lists them).
+
+Two copies with a spawned M2 Rover in each (different ids): the owner on A's gun put Frank on B's gun (placed, no
+entry animation); A's driver seat put him in B's driver seat; B's player bound to B's gun by script while the owner
+drove A's Rover: "Frank in B is driving the car and looks good". Not working yet: an AI body bound to a gunner or
+passenger seat is not carried; when the car drove off, A's Frank was left behind and ran (players and AI drivers stay
+attached). The way forward is the AI's own vehicle-use event, `CEventMercCommandUseVehicleSeat` (handler
+FUN_1096cc90), which enemy crews use. Test commands: `vseats <vehicle>`, `vmap <x> <y> <z>`.
+
 ### Driven legs
 
 Packet magic `FC2A`. The player's movement code ends by writing its desired movement into the control block (+0xb0/+0xb4/+0xb8, world m/s; FUN_10143de0), and the pawn's locomotion follows it with its own walk, run and sprint animations; an AI pawn does too (one copy, `ctl <Frank> move`: 1.5 m/s walked at ~1.5, 3.8 ran at ~3.6, 7.9 sprinted at ~7.4, stopping within 0.7 m). The sender sends its own; the body's copy, on foot, writes the peer's movement plus a pull toward the peer's position (1.2 per second, at most 4 m/s) into the body's block on each update, and holds MoveTo (`MoveToStopped` instead). The 10 m teleport, the glide and the vehicle seat stay; on foot the glide starts only above 12 m/s (a sprint's first burst is 8.9 m/s, above the default `aiglide` 8). The sprint flag is the write block's bit (set by the key) or the read block's (+0x2d0, kept by the movement code for the rest of the sprint). `aidrive 0` goes back to the MoveTo follower.

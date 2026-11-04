@@ -348,6 +348,7 @@ static unsigned g_net_lport, g_net_pport;
 static int g_net_hz = 30;
 static char g_net_pip[32];
 static unsigned long long g_net_id;
+static int g_net_seat = -1, g_net_stype;  /* the local player's seat in g_net_veh and its type */
 static char g_natpath[MAX_PATH];
 static int g_hold;
 static unsigned long long g_hold_id;
@@ -882,6 +883,134 @@ static BYTE *veh_motion(BYTE *ent, int log)
     return best;
 }
 
+/* A vehicle's seats (as BindToVehicleRide, FUN_109f9d40 -> FUN_10957310, finds them): the vehicle's CAIComponent
+ * (tag Dunia+0xfe4090, registered by FUN_1010f170 when the flag +0xfe4080 is 0) holds its seat manager at +0x14;
+ * the seats are { pointer, count } at *(*(manager + 0x210) + 0x10) + 0xc, 0x50 bytes each: +0x10 seat type
+ * (SEAT_DRIVER 1, SEAT_GUNNER 2, 3 passenger), +0x28 occupant entity id (all ones = free). Rover: seat 0 driver,
+ * 1 passenger, 2 the mounted gun; Datsun: 0 standing in the back, 1 driver. */
+#define SEAT_DRIVER 1
+#define SEAT_GUNNER 2
+#define RVA_AITAG_REG  0x10f170
+#define RVA_AITAG_FLAG 0xfe4080
+#define RVA_AITAG      0xfe4090
+#define SEAT_SIZE 0x50
+
+/* the vehicle's seat array and count, or NULL */
+static BYTE *veh_seats(BYTE *ent, int *n)
+{
+    BYTE *c, *m, *o, *l;
+    *n = 0;
+    if (*(int *)(g_base + RVA_AITAG_FLAG) == 0) ((reg_t)(g_base + RVA_AITAG_REG))(NULL);
+    c = ((getcomp_t)(g_base + RVA_GETCOMPONENT))(ent, g_base + RVA_AITAG);
+    if (!c || IsBadReadPtr(c + 0x14, 4) || !(m = *(BYTE **)(c + 0x14)) || IsBadReadPtr(m + 0x210, 4)) return NULL;
+    if (!(o = *(BYTE **)(m + 0x210)) || IsBadReadPtr(o + 0x10, 4)) return NULL;
+    if (!(l = *(BYTE **)(o + 0x10)) || IsBadReadPtr(l + 0xc, 8)) return NULL;
+    *n = *(int *)(l + 0x10);
+    if (*n <= 0 || *n > 16 || IsBadReadPtr(*(BYTE **)(l + 0xc), *n * SEAT_SIZE)) { *n = 0; return NULL; }
+    return *(BYTE **)(l + 0xc);
+}
+
+/* the seat the entity sits in, or -1; *type its seat type */
+static int veh_seat_of(BYTE *ent, unsigned long long who, int *type)
+{
+    int n, i;
+    BYTE *s = veh_seats(ent, &n);
+    for (i = 0; s && i < n; i++)
+        if (*(unsigned long long *)(s + i * SEAT_SIZE + 0x28) == who) { if (type) *type = *(int *)(s + i * SEAT_SIZE + 0x10); return i; }
+    if (type) *type = 0;
+    return -1;
+}
+
+/* A vehicle spawned during play (a patrol, one spawned for a test) has another id in each world. The peer's vehicle
+ * is then the nearest entity with vehicle seats within VMAP_RADIUS m of the peer's. Entities (vtable Dunia+0xe6b464,
+ * every entity has it, id at +8, position +0x60) near there are collected by a thread that reads all memory for them
+ * (1-2 s; ReadProcessMemory on our own process, so a page freed meanwhile only fails the read); the main thread
+ * then takes the nearest that has seats. */
+#define RVA_VEH_ENTITY_VT 0xe6b464
+#define VMAP_RADIUS 8.0f
+#define VMAP_MAX 32
+static volatile LONG g_vmap_busy;
+static volatile unsigned long long g_vmap_from, g_vmap_to;
+static unsigned long long g_vmap_ids[VMAP_MAX];
+static float g_vmap_d[VMAP_MAX];
+static int g_vmap_n;
+static volatile int g_vmap_done;
+static float g_vmap_pos[3], g_vmap_dist;
+static unsigned g_vmap_hits, g_vmap_fails;
+
+static DWORD WINAPI vmap_thread(LPVOID unused)
+{
+    static DWORD buf[0x4000];
+    MEMORY_BASIC_INFORMATION mbi;
+    BYTE *p = NULL;
+    DWORD want = (DWORD)(g_base + RVA_VEH_ENTITY_VT);
+    unsigned long long best = 0;
+    float bd = VMAP_RADIUS * VMAP_RADIUS;
+    g_vmap_n = 0;
+    HANDLE me = GetCurrentProcess();
+    (void)unused;
+    g_vmap_hits = g_vmap_fails = 0;
+    while (VirtualQuery(p, &mbi, sizeof mbi) == sizeof mbi) {
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) && !(mbi.Protect & PAGE_GUARD) && mbi.RegionSize < 0x20000000) {
+            BYTE *q = mbi.BaseAddress, *end = q + mbi.RegionSize;
+            for (; q < end; q += sizeof buf) {
+                SIZE_T got = 0, n = (SIZE_T)(end - q) < sizeof buf ? (SIZE_T)(end - q) : sizeof buf, k;
+                if (!ReadProcessMemory(me, q, buf, n, &got)) { g_vmap_fails++; continue; }
+                for (k = 0; k + 1 < got / 4; k++) {
+                    float e[3], d;
+                    unsigned long long id;
+                    if (buf[k] != want) continue;
+                    g_vmap_hits++;
+                    if (!ReadProcessMemory(me, q + 4 * k + 0x60, e, sizeof e, NULL) || !ReadProcessMemory(me, q + 4 * k + 8, &id, sizeof id, NULL)) continue;
+                    d = (e[0] - g_vmap_pos[0]) * (e[0] - g_vmap_pos[0]) + (e[1] - g_vmap_pos[1]) * (e[1] - g_vmap_pos[1]) + (e[2] - g_vmap_pos[2]) * (e[2] - g_vmap_pos[2]);
+                    if (d < VMAP_RADIUS * VMAP_RADIUS && g_vmap_n < VMAP_MAX) { g_vmap_ids[g_vmap_n] = id; g_vmap_d[g_vmap_n++] = d; }
+                    if (d < bd) { bd = d; best = id; }
+                }
+            }
+        }
+        p = (BYTE *)mbi.BaseAddress + mbi.RegionSize;
+    }
+    g_vmap_dist = sqrtf(bd);
+    g_vmap_to = best; g_vmap_done = 1;
+    InterlockedExchange(&g_vmap_busy, 0);
+    return 0;
+}
+
+/* our id of the peer's vehicle: its own when this world has it, else the scan's answer (0 while it runs or when
+ * none is near); *wait 1 while a scan for it runs */
+static unsigned long long veh_local(unsigned long long rid, const float *rpos, int *wait)
+{
+    void *holder = NULL;
+    BYTE *v = entity_obj(rid, &holder);
+    int here = v && !IsBadReadPtr(v, 0x70) && *(DWORD *)v == (DWORD)(g_base + RVA_VEH_ENTITY_VT);
+    if (holder) (*(int *)((BYTE *)holder + 8))--;
+    *wait = 0;
+    if (here) return rid;
+    if (g_vmap_done && g_vmap_from == rid) {
+        /* the nearest candidate with seats */
+        int i, n;
+        unsigned long long best = 0;
+        float bd = 1e9f;
+        for (i = 0; i < g_vmap_n; i++) {
+            BYTE *e;
+            if (g_vmap_d[i] >= bd || !(e = entity_obj(g_vmap_ids[i], &holder))) { if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; } continue; }
+            if (!IsBadReadPtr(e, 0x70) && veh_seats(e, &n)) { bd = g_vmap_d[i]; best = g_vmap_ids[i]; }
+            if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
+        }
+        if (best) logf_("ai: peer's vehicle %llu is our %llu (%.1f m from where the peer's is)", rid, best, sqrtf(bd));
+        return best;
+    }
+    *wait = 1;
+    if (InterlockedCompareExchange(&g_vmap_busy, 1, 0) == 0) {
+        HANDLE t;
+        g_vmap_from = rid; g_vmap_done = 0; memcpy(g_vmap_pos, rpos, sizeof g_vmap_pos);
+        logf_("ai: peer's vehicle %llu has no copy under that id here, looking for the nearest vehicle", rid);
+        if ((t = CreateThread(NULL, 0, vmap_thread, NULL, 0, NULL))) CloseHandle(t);
+        else { InterlockedExchange(&g_vmap_busy, 0); g_vmap_done = 1; g_vmap_to = 0; }
+    }
+    return 0;
+}
+
 /* vin (vehicle input, h_vehinput below) */
 static BYTE *g_vin_veh;          /* the vehicle object whose input is replaced */
 static BYTE g_vin_rec[12];       /* its record */
@@ -933,6 +1062,32 @@ static int veh_cmd(const char *ln)
             return 1;
         }
         return 0;
+    }
+    if (sscanf(ln, "vmap %f %f %f", &v[0], &v[1], &v[2]) == 3) {
+        memcpy(g_vmap_pos, v, sizeof g_vmap_pos);
+        g_vmap_done = 0;
+        vmap_thread(NULL);
+        logf_("vmap: %u objects of the class, %u failed reads, %d within %.0f m, nearest %llu at %.2f m", g_vmap_hits, g_vmap_fails, g_vmap_n, VMAP_RADIUS, g_vmap_to, g_vmap_dist);
+        for (int i = 0; i < g_vmap_n; i++) {
+            void *h = NULL;
+            BYTE *e = entity_obj(g_vmap_ids[i], &h);
+            int n = 0;
+            if (e && !IsBadReadPtr(e, 0x70)) veh_seats(e, &n);
+            if (h) (*(int *)((BYTE *)h + 8))--;
+            logf_("vmap: %llu at %.2f m, %d seats", g_vmap_ids[i], sqrtf(g_vmap_d[i]), n);
+        }
+        return 1;
+    }
+    if (sscanf(ln, "vseats %llu", &id) == 1) {
+        int n, i;
+        BYTE *st;
+        ent = entity_obj(id, &holder);
+        st = ent && !IsBadReadPtr(ent, 0x70) ? veh_seats(ent, &n) : NULL;
+        if (!st) logf_("vseats %llu: no seats found", id);
+        for (i = 0; st && i < n; i++)
+            logf_("vseats %llu: seat %d type %d occupant %llu", id, i, *(int *)(st + i * SEAT_SIZE + 0x10), *(unsigned long long *)(st + i * SEAT_SIZE + 0x28));
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        return 1;
     }
     if (strncmp(ln, "vpc ", 4) == 0) {
         char what[8] = "";
@@ -1884,11 +2039,11 @@ static void hold_tick(void)
  * sender's last bullet; flags: NET_DEAD while the sender's game-over screen is up, NET_AIMING while its player aims, NET_FLAME while its flamethrower burns, NET_CROUCH / NET_SPRINT while its player crouches / sprints; look: camera direction; jumps: jumps the sender's player made so far;
  * mv: the sender's desired movement (control block +0xb0/+0xb4, world m/s); vrec: its vehicle's driver input
  * (throttle, steering) with vflags VEH_HANDBRAKE / VEH_REVERSE / VEH_INPUT (vrec valid); vvel, vwz: the vehicle's
- * linear velocity and yaw rate */
+ * linear velocity and yaw rate; vseat, vstype: the sender's seat in it and its type (SEAT_DRIVER ...), -1 / 0 unknown */
 typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; unsigned jumps; float mv[2];
-                 float vrec[2]; unsigned vflags; float vvel[3]; float vwz; } NetPkt;
+                 float vrec[2]; unsigned vflags; float vvel[3]; float vwz; int vseat, vstype; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x42324346u
+#define NET_MAGIC 0x43324346u
 #define VEH_HANDBRAKE 1u
 #define VEH_REVERSE 2u
 #define VEH_INPUT 4u
@@ -2065,7 +2220,8 @@ static int g_ai_lost;
 static unsigned g_ai_spawns, g_ai_stuck;
 /* the peer's vehicle: our copy of it (both load the same save, so it has the same id) with its physics off,
  * placed from the packets every frame, our pawn seated in it; g_ai_noveh is one this world does not have */
-static unsigned long long g_ai_veh, g_ai_noveh;
+static unsigned long long g_ai_veh, g_ai_noveh, g_ai_vehsrc;  /* g_ai_vehsrc: the peer's id of g_ai_veh */
+static int g_ai_seat = -1;  /* the seat the body was put in */
 static int g_ai_seated, g_ai_seattries;
 static DWORD g_ai_lastseat;
 /* the peer's weapon on our body: one spawned weapon entity per category, and what the body last got */
@@ -2092,7 +2248,7 @@ static void ai_vehicle_release(void)
 {
     void *holder = NULL, *phys;
     BYTE *v;
-    g_vt_on = 0; g_vin_veh = NULL;
+    g_vt_on = 0; g_vin_veh = NULL; g_ai_vehsrc = 0; g_ai_seat = -1;
     if (!g_ai_veh) return;
     v = entity_obj(g_ai_veh, &holder);
     if (v && (phys = ent_physics(v))) ent_set_physics(phys, 1);
@@ -2453,18 +2609,30 @@ static int ai_drive(DWORD now, const float *t, const float *p)
     BYTE *v;
     float pos[3], lead, yaw, d, err = 0;
     char code[512], out[32];
-    if (g_ai_veh != g_remote.veh) {
+    int drives = g_remote.vstype == SEAT_DRIVER;  /* the peer is its driver */
+    /* getting in, the peer is in no seat yet for a moment: wait for it */
+    if (g_remote.vseat < 0 && g_ai_vehsrc != g_remote.veh) return 0;
+    if (g_ai_vehsrc != g_remote.veh) {
+        unsigned long long lid;
+        int wait;
         ai_vehicle_release();
-        v = entity_obj(g_remote.veh, &holder);
+        lid = veh_local(g_remote.veh, g_remote.vpos, &wait);
+        if (wait) return 0;
+        v = lid ? entity_obj(lid, &holder) : NULL;
         phys = v && !IsBadReadPtr(v, 0x70) ? ent_physics(v) : NULL;
         if (phys && !g_vdrive) ent_set_physics(phys, 0);
         g_vdrive_snap = 0;
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
-        if (!phys) { logf_("ai: peer's vehicle %llu is not in this world, walking instead", g_remote.veh); g_ai_noveh = g_remote.veh; return 0; }
-        g_ai_veh = g_remote.veh; g_ai_seated = 0; g_ai_seattries = 0; g_ai_lastseat = 0;
+        if (!phys) {
+            logf_("ai: peer's vehicle %llu is not in this world, walking instead (scan: %u objects, %u failed reads, nearest %.1f m)", g_remote.veh,
+                  g_vmap_hits, g_vmap_fails, g_vmap_dist);
+            g_ai_noveh = g_remote.veh; return 0;
+        }
+        g_ai_veh = lid; g_ai_vehsrc = g_remote.veh; g_ai_seated = 0; g_ai_seattries = 0; g_ai_lastseat = 0;
         snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
         lua_eval(code, out, sizeof out);
-        logf_("ai: peer entered vehicle %llu, %s", g_ai_veh, g_vdrive ? "driven with the peer's input" : "physics off");
+        logf_("ai: peer entered vehicle %llu (ours %llu), seat %d type %d%s", g_remote.veh, g_ai_veh, g_remote.vseat, g_remote.vstype,
+              drives ? (g_vdrive ? ", driven with the peer's input" : ", physics off") : ", rides");
     }
     v = entity_obj(g_ai_veh, &holder);
     if (!v || IsBadReadPtr(v, 0x70)) {
@@ -2476,7 +2644,10 @@ static int ai_drive(DWORD now, const float *t, const float *p)
     lead = fminf((now - g_net_lastrx) / 1000.0f, 0.25f);
     /* the forward vector is the matrix's local +Y, hence the quarter turn (as noclip seeds its yaw) */
     yaw = atan2f(g_remote.vfwd[1], g_remote.vfwd[0]) - 1.5707963f;
-    if (!g_vdrive) {
+    if (!drives || (g_net_veh == g_ai_veh && g_net_stype == SEAT_DRIVER)) {
+        /* the peer rides, or the local player drives this car: it moves the way this world drives it */
+        g_vt_on = 0; g_vin_veh = NULL;
+    } else if (!g_vdrive) {
         pos[0] = g_remote.vpos[0] + g_ai_vel[0] * lead; pos[1] = g_remote.vpos[1] + g_ai_vel[1] * lead; pos[2] = g_remote.vpos[2];
         ent_place(v, pos, yaw);
     } else {
@@ -2504,16 +2675,31 @@ static int ai_drive(DWORD now, const float *t, const float *p)
     if (holder) (*(int *)((BYTE *)holder + 8))--;
     /* seating waits for the pawn to have loaded, as the game's VehicleRide box does; CVehicle_GetCurrentVehicle
      * on a pawn that is not there reads a null pointer (Dunia+0xe7337) */
+    /* the driver's seat through SetupVehicleFollowPath (the AI then drives, with our input), any other seat through
+     * BindToVehicleRide (vehicleride.lua); the peer changing seats seats the body again */
+    if (g_ai_seated && g_remote.vseat >= 0 && g_ai_seat != g_remote.vseat) { g_ai_seated = 0; g_ai_seattries = 0; g_ai_lastseat = 0; }
     if (!g_ai_seated && now - g_ai_lastseat >= 1000) {
+        int want = g_remote.vseat;
         g_ai_lastseat = now;
-        snprintf(code, sizeof code,
-                 "if IsEntityValid('%llu') ~= 1 or IsEntityLoaded('%llu') ~= 1 then __out = 'wait' else "
-                 "local v = CVehicle_GetCurrentVehicle('%llu') if v and tostring(v:GetEntity()) == '%llu' then __out = 'in' "
-                 "else SetupVehicleFollowPath('%llu', '%llu', GetInvalidEntityId()) __out = 'seat' end end",
-                 g_ai_id, g_ai_id, g_ai_id, g_ai_veh, g_ai_veh, g_ai_id);
+        if (drives)
+            snprintf(code, sizeof code,
+                     "if IsEntityValid('%llu') ~= 1 or IsEntityLoaded('%llu') ~= 1 then __out = 'wait' else "
+                     "local v = CVehicle_GetCurrentVehicle('%llu') if v and tostring(v:GetEntity()) == '%llu' then __out = 'in' "
+                     "else SetupVehicleFollowPath('%llu', '%llu', GetInvalidEntityId()) __out = 'seat' end end",
+                     g_ai_id, g_ai_id, g_ai_id, g_ai_veh, g_ai_veh, g_ai_id);
+        else
+            snprintf(code, sizeof code,
+                     "if IsEntityValid('%llu') ~= 1 or IsEntityLoaded('%llu') ~= 1 then __out = 'wait' else "
+                     "BindToVehicleRide('%llu', '%llu', %d) __out = 'bound' end", g_ai_id, g_ai_id, g_ai_veh, g_ai_id, want);
         lua_eval(code, out, sizeof out);
-        if (strcmp(out, "in") == 0) { g_ai_seated = 1; logf_("ai: body seated in vehicle %llu", g_ai_veh); }
-        else if (++g_ai_seattries == 6) logf_("ai: body still not seated after 6 tries (%s)", out);
+        if (strcmp(out, "wait") != 0) {
+            int got = veh_seat_of(v, g_ai_id, NULL);
+            if (strcmp(out, "in") == 0 || (want >= 0 && got == want)) {
+                g_ai_seated = 1; g_ai_seat = want >= 0 ? want : got;
+                logf_("ai: body seated in vehicle %llu, seat %d", g_ai_veh, got);
+            }
+        }
+        if (!g_ai_seated && ++g_ai_seattries == 6) logf_("ai: body still not seated after 6 tries (%s, seat %d)", out, veh_seat_of(v, g_ai_id, NULL));
     }
     if (now - g_ai_lastlog >= 1000) {
         g_ai_lastlog = now;
@@ -2748,8 +2934,10 @@ static void ai_tick(void)
         memcpy(g_ai_prev, t, 12); g_ai_prevt = now;
     }
     if (g_ai_src == AI_REMOTE && g_ai_arch[0]) {
-        /* not a vehicle the local player sits in: both would drive it */
-        if (g_remote.veh && g_remote.veh != g_ai_noveh && g_remote.veh != g_net_veh) {
+        /* not the car the local player drives when the peer drives it too */
+        int same = g_remote.veh == g_net_veh || (g_ai_vehsrc == g_remote.veh && g_ai_veh == g_net_veh);
+        if (g_remote.veh && g_remote.veh != g_ai_noveh &&
+            !(same && g_net_stype == SEAT_DRIVER && g_remote.vstype == SEAT_DRIVER)) {
             if (ai_drive(now, t, p)) return;
         } else if (g_ai_veh) {
             logf_("ai: peer left vehicle %llu", g_ai_veh);
@@ -3030,6 +3218,8 @@ static void net_tick(void)
         if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
         if (g_net_veh && (obj = entity_obj(g_net_veh, &holder)) && !IsBadReadPtr(obj, 0x70)) {
             p.veh = g_net_veh;
+            p.vseat = veh_seat_of(obj, g_net_id, &p.vstype);
+            g_net_seat = p.vseat; g_net_stype = p.vstype;
             memcpy(p.vpos, obj + 0x60, sizeof p.vpos);
             p.vfwd[0] = *(float *)(obj + 0x40); p.vfwd[1] = *(float *)(obj + 0x44);
             {
