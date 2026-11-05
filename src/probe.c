@@ -928,7 +928,7 @@ static int veh_seat_of(BYTE *ent, unsigned long long who, int *type)
  * then takes the nearest that has seats. */
 #define RVA_VEH_ENTITY_VT 0xe6b464
 #define VMAP_RADIUS 8.0f
-#define VMAP_MAX 32
+#define VMAP_MAX 256  /* entities within VMAP_RADIUS; 32 were too few with two pawns next to the car */
 static volatile LONG g_vmap_busy;
 static volatile unsigned long long g_vmap_from, g_vmap_to;
 static unsigned long long g_vmap_ids[VMAP_MAX];
@@ -1011,6 +1011,54 @@ static unsigned long long veh_local(unsigned long long rid, const float *rpos, i
     return 0;
 }
 
+/* The AI's own way into a vehicle seat: the merc agent (vtable Dunia+0xec5078, constructor FUN_10972870, which registers
+ * its command handlers by event id; a pawn's agent is its CAIComponent + 0x14, as for vehicles) handles
+ * CEventMercCommandUseVehicleSeat (id 0x8b0ef7e0) in FUN_1096cc90 (thiscall(agent, event), RET 4): it checks the event's
+ * type through the interface at event + 8 (vtable slot 1 returns a type record whose +4 > 1 and +0xc equals that of
+ * the class's own record Dunia+0x16557f4, which FUN_10960c70 fills the first time; a value read before that does not
+ * match and the handler then reads through a null event: crash), then writes the AI's facts: use vehicle +0x10 (id) in seat type +0x18 (1 driver, 2 gunner, 3 passenger),
+ * +0x1c, and for a driver agent bit 0x25 from byte +0x28. pawn_use_seat hands it such an event of our own (its reference
+ * count never reaches 0, so the handler never frees it). Frank's buddy AI does not go and get in on it, but an AI pawn put
+ * in a gunner seat with BindToVehicleRide is then carried by the car (copy A: 40 m driven, 0.7 m behind the car's
+ * centre); without those facts it is left behind and runs. */
+#define RVA_MERCAGENT_VT   0xec5078
+#define RVA_USESEAT        0x96cc90
+#define RVA_USESEAT_TYPE   0x16557f4
+#define RVA_USESEAT_TYPEREG 0x960c70
+typedef int (__attribute__((thiscall)) *useseat_t)(void *agent, void *event);
+typedef void *(*typereg_t)(void);
+static void *__attribute__((thiscall)) fake_gettype(void *self) { (void)self; return g_base + RVA_USESEAT_TYPE; }
+static void __attribute__((thiscall)) fake_release(void *self) { (void)self; }
+static void *g_fake_vt[4] = { NULL, (void *)fake_release, NULL, NULL };
+static void *g_fake_typevt[4] = { NULL, (void *)fake_gettype, NULL, NULL };
+#pragma pack(push, 1)
+static struct { void **vt; LONG ref; void **typevt; DWORD pad; unsigned long long veh; int stype; int seat; DWORD pad2[2]; BYTE flag; BYTE pad3[15]; } g_fake_ev;
+#pragma pack(pop)
+
+/* a pawn's merc agent, or NULL */
+static BYTE *pawn_agent(BYTE *ent)
+{
+    BYTE *c;
+    if (*(int *)(g_base + RVA_AITAG_FLAG) == 0) ((reg_t)(g_base + RVA_AITAG_REG))(NULL);
+    c = ((getcomp_t)(g_base + RVA_GETCOMPONENT))(ent, g_base + RVA_AITAG);
+    if (!c || IsBadReadPtr(c + 0x14, 4) || !*(BYTE **)(c + 0x14) || IsBadReadPtr(*(BYTE **)(c + 0x14), 0x270)) return NULL;
+    return *(BYTE **)(c + 0x14);
+}
+
+/* tells a pawn's AI to use a vehicle seat of the given type; 0 when it has no merc agent */
+static int pawn_use_seat(BYTE *ent, unsigned long long veh, int stype, int seat)
+{
+    BYTE *ag = pawn_agent(ent);
+    if (!ag || *(BYTE **)ag != g_base + RVA_MERCAGENT_VT) return 0;
+    if (*(DWORD *)(g_base + RVA_USESEAT_TYPE) == 0) ((typereg_t)(g_base + RVA_USESEAT_TYPEREG))();
+    if (*(DWORD *)(g_base + RVA_USESEAT_TYPE + 4) <= 1) { logf_("use seat: unexpected type record, not sent"); return 0; }
+    memset(&g_fake_ev, 0, sizeof g_fake_ev);
+    g_fake_ev.vt = g_fake_vt; g_fake_ev.ref = 1000; g_fake_ev.typevt = g_fake_typevt;
+    g_fake_ev.veh = veh; g_fake_ev.stype = stype; g_fake_ev.seat = seat;
+    ((useseat_t)(g_base + RVA_USESEAT))(ag, &g_fake_ev);
+    return 1;
+}
+
 /* vin (vehicle input, h_vehinput below) */
 static BYTE *g_vin_veh;          /* the vehicle object whose input is replaced */
 static BYTE g_vin_rec[12];       /* its record */
@@ -1062,6 +1110,18 @@ static int veh_cmd(const char *ln)
             return 1;
         }
         return 0;
+    }
+    if (strncmp(ln, "aiseat ", 7) == 0) {
+        unsigned long long veh;
+        int st = 0, seat = -1;
+        BYTE *ag;
+        if (sscanf(ln, "aiseat %llu %llu %d %d", &id, &veh, &st, &seat) < 3) return 0;
+        ent = entity_obj(id, &holder);
+        ag = ent && !IsBadReadPtr(ent, 0x70) ? pawn_agent(ent) : NULL;
+        logf_("aiseat %llu: agent %p vtable rva %lx (merc agent %lx)", id, ag, ag ? (unsigned long)(*(BYTE **)ag - g_base) : 0UL, (unsigned long)RVA_MERCAGENT_VT);
+        if (ag) logf_("aiseat %llu: %s vehicle %llu seat type %d seat %d", id, pawn_use_seat(ent, veh, st, seat) ? "told to use" : "not a merc agent, not told", veh, st, seat);
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        return 1;
     }
     if (sscanf(ln, "vmap %f %f %f", &v[0], &v[1], &v[2]) == 3) {
         memcpy(g_vmap_pos, v, sizeof g_vmap_pos);
@@ -2221,6 +2281,7 @@ static unsigned g_ai_spawns, g_ai_stuck;
 /* the peer's vehicle: our copy of it (both load the same save, so it has the same id) with its physics off,
  * placed from the packets every frame, our pawn seated in it; g_ai_noveh is one this world does not have */
 static unsigned long long g_ai_veh, g_ai_noveh, g_ai_vehsrc;  /* g_ai_vehsrc: the peer's id of g_ai_veh */
+static DWORD g_ai_noveh_t;  /* when g_ai_noveh was set; looked for again after 10 s */
 static int g_ai_seat = -1;  /* the seat the body was put in */
 static int g_ai_seated, g_ai_seattries;
 static DWORD g_ai_lastseat;
@@ -2626,9 +2687,10 @@ static int ai_drive(DWORD now, const float *t, const float *p)
         if (!phys) {
             logf_("ai: peer's vehicle %llu is not in this world, walking instead (scan: %u objects, %u failed reads, nearest %.1f m)", g_remote.veh,
                   g_vmap_hits, g_vmap_fails, g_vmap_dist);
-            g_ai_noveh = g_remote.veh; return 0;
+            g_ai_noveh = g_remote.veh; g_ai_noveh_t = now; return 0;
         }
         g_ai_veh = lid; g_ai_vehsrc = g_remote.veh; g_ai_seated = 0; g_ai_seattries = 0; g_ai_lastseat = 0;
+        g_ai_glide = 0;  /* the glide teleports him onto the peer, into the car */
         snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
         lua_eval(code, out, sizeof out);
         logf_("ai: peer entered vehicle %llu (ours %llu), seat %d type %d%s", g_remote.veh, g_ai_veh, g_remote.vseat, g_remote.vstype,
@@ -2638,7 +2700,7 @@ static int ai_drive(DWORD now, const float *t, const float *p)
     if (!v || IsBadReadPtr(v, 0x70)) {
         if (holder) (*(int *)((BYTE *)holder + 8))--;
         logf_("ai: vehicle %llu gone", g_ai_veh);
-        g_ai_noveh = g_ai_veh; g_ai_veh = 0; g_ai_seated = 0;
+        g_ai_noveh = g_ai_veh; g_ai_noveh_t = now; g_ai_veh = 0; g_ai_seated = 0;
         return 0;
     }
     lead = fminf((now - g_net_lastrx) / 1000.0f, 0.25f);
@@ -2680,17 +2742,34 @@ static int ai_drive(DWORD now, const float *t, const float *p)
     if (g_ai_seated && g_remote.vseat >= 0 && g_ai_seat != g_remote.vseat) { g_ai_seated = 0; g_ai_seattries = 0; g_ai_lastseat = 0; }
     if (!g_ai_seated && now - g_ai_lastseat >= 1000) {
         int want = g_remote.vseat;
+        float fp[3], *cm = (float *)(v + 0x30);
         g_ai_lastseat = now;
+        /* bound to a seat while standing inside the car's body (gliding along with the peer's car, say), the physics
+         * threw him 2 km; a teleport next to the car did not take. He is spawned again 5 m to the car's side and
+         * bound once loaded */
+        if (!drives && ent_pos(g_ai_id, fp) && (fp[0] - cm[12]) * (fp[0] - cm[12]) + (fp[1] - cm[13]) * (fp[1] - cm[13]) < 3.5f * 3.5f) {
+            float aside[3];
+            aside[0] = cm[12] + cm[0] * 5.0f; aside[1] = cm[13] + cm[1] * 5.0f; aside[2] = cm[14] + 0.5f;
+            if (holder) { (*(int *)((BYTE *)holder + 8))--; holder = NULL; }
+            ai_spawn(aside, "clear of the car before seating");
+            return 1;
+        }
         if (drives)
             snprintf(code, sizeof code,
                      "if IsEntityValid('%llu') ~= 1 or IsEntityLoaded('%llu') ~= 1 then __out = 'wait' else "
                      "local v = CVehicle_GetCurrentVehicle('%llu') if v and tostring(v:GetEntity()) == '%llu' then __out = 'in' "
                      "else SetupVehicleFollowPath('%llu', '%llu', GetInvalidEntityId()) __out = 'seat' end end",
                      g_ai_id, g_ai_id, g_ai_id, g_ai_veh, g_ai_veh, g_ai_id);
-        else
+        else {
+            /* the AI must know it is to use the vehicle in that seat, or it leaves it when the car moves */
+            void *bh = NULL;
+            BYTE *be = entity_obj(g_ai_id, &bh);
+            if (be && !IsBadReadPtr(be, 0x70) && !pawn_use_seat(be, g_ai_veh, g_remote.vstype, want)) logf_("ai: body has no merc agent for its seat");
+            if (bh) (*(int *)((BYTE *)bh + 8))--;
             snprintf(code, sizeof code,
                      "if IsEntityValid('%llu') ~= 1 or IsEntityLoaded('%llu') ~= 1 then __out = 'wait' else "
                      "BindToVehicleRide('%llu', '%llu', %d) __out = 'bound' end", g_ai_id, g_ai_id, g_ai_veh, g_ai_id, want);
+        }
         lua_eval(code, out, sizeof out);
         if (strcmp(out, "wait") != 0) {
             int got = veh_seat_of(v, g_ai_id, NULL);
@@ -2936,6 +3015,7 @@ static void ai_tick(void)
     if (g_ai_src == AI_REMOTE && g_ai_arch[0]) {
         /* not the car the local player drives when the peer drives it too */
         int same = g_remote.veh == g_net_veh || (g_ai_vehsrc == g_remote.veh && g_ai_veh == g_net_veh);
+        if (g_ai_noveh && now - g_ai_noveh_t > 10000) { g_ai_noveh = 0; g_vmap_done = 0; g_vmap_from = 0; }
         if (g_remote.veh && g_remote.veh != g_ai_noveh &&
             !(same && g_net_stype == SEAT_DRIVER && g_remote.vstype == SEAT_DRIVER)) {
             if (ai_drive(now, t, p)) return;

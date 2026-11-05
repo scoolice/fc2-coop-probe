@@ -338,10 +338,17 @@ meanwhile only fails the read), and the main thread checks which has seats (`vma
 
 Two copies with a spawned M2 Rover in each (different ids): the owner on A's gun put Frank on B's gun (placed, no
 entry animation); A's driver seat put him in B's driver seat; B's player bound to B's gun by script while the owner
-drove A's Rover: "Frank in B is driving the car and looks good". Not working yet: an AI body bound to a gunner or
-passenger seat is not carried; when the car drove off, A's Frank was left behind and ran (players and AI drivers stay
-attached). The way forward is the AI's own vehicle-use event, `CEventMercCommandUseVehicleSeat` (handler
-FUN_1096cc90), which enemy crews use. Test commands: `vseats <vehicle>`, `vmap <x> <y> <z>`.
+drove A's Rover: "Frank in B is driving the car and looks good".
+
+An AI body bound to a gunner or passenger seat is only placed: when the car drove off, Frank was left behind and ran.
+It stays when its AI also knows it is to use that seat: the merc agent (vtable Dunia+0xec5078, the pawn's CAIComponent
++ 0x14) handles `CEventMercCommandUseVehicleSeat` in FUN_1096cc90 (event +0x10 vehicle id, +0x18 seat type), which
+writes those facts; the probe hands it an event of its own (its type record is the class's own, Dunia+0x16557f4,
+registered first by FUN_10960c70) before binding. Frank's buddy AI does not walk to the car on it, so the binding
+stays. Bound while standing inside the car's body, he was thrown 2 km by the physics, so he is spawned 5 m to the car's
+side first. Two copies, the owner driving A's Rover with B's player on B's gun: "this works great now"; in A Frank
+sat a median 0.52 m from where B's player is, B's Rover stayed a median 0.64 m from A's. No entry animation on those
+seats yet. Test commands: `vseats <vehicle>`, `vmap <x> <y> <z>`, `aiseat <pawn> <vehicle> <seat type> [seat]`.
 
 ### Driven legs
 
