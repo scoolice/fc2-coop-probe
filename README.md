@@ -363,6 +363,14 @@ last angles are kept while the sender stays on the gun (a copy in the background
 Two copies: the body's gun on B follows the owner's aim on A in both axes and fires with it ("Thats working great
 now"), also while the owner drives B's car. Not checked yet: damage from those rounds, B's player as the gunner.
 
+**Boats.** A boat is not a Havok vehicle instance; its own step FUN_104aa970 (thiscall(boat, step), called by its
+Havok action) reads the same driver input record, from the controller at boat + 0x19c, and its rigid body is at
+boat + 0x68. It is hooked like the car's input step (input replay and the same correction). Found by watching reads
+of the boat's record with `hwbp <addr> rw` (read/write breakpoint); `vrec <entity>` logs any vehicle's record (the
+vehicle's component with tag Dunia+0xfde25c, FUN_100695c0 for its controller, vtable +0x134). Two copies, swamp boat
+with an M2 on a river: the gun syncs as on the Rover, and B's boat stayed a median 0.03 m from A's (max 0.09 m). A
+vehicle with neither (none known) is placed every frame with its physics off.
+
 ### Driven legs
 
 Packet magic `FC2A`. The player's movement code ends by writing its desired movement into the control block (+0xb0/+0xb4/+0xb8, world m/s; FUN_10143de0), and the pawn's locomotion follows it with its own walk, run and sprint animations; an AI pawn does too (one copy, `ctl <Frank> move`: 1.5 m/s walked at ~1.5, 3.8 ran at ~3.6, 7.9 sprinted at ~7.4, stopping within 0.7 m). The sender sends its own; the body's copy, on foot, writes the peer's movement plus a pull toward the peer's position (1.2 per second, at most 4 m/s) into the body's block on each update, and holds MoveTo (`MoveToStopped` instead). The 10 m teleport, the glide and the vehicle seat stay; on foot the glide starts only above 12 m/s (a sprint's first burst is 8.9 m/s, above the default `aiglide` 8). The sprint flag is the write block's bit (set by the key) or the read block's (+0x2d0, kept by the movement code for the rest of the sprint). `aidrive 0` goes back to the MoveTo follower.

@@ -389,7 +389,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep)
 WINBASEAPI PVOID WINAPI AddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_HANDLER);
 /* hwbp: a hardware write breakpoint (debug register 0) on one byte, set on every thread of the game. Each write
  * traps after the writing instruction; the handler only counts the instruction addresses, hwlog prints them. */
-static DWORD g_hw_addr, g_hw_eip[16], g_hw_cnt[16];
+static DWORD g_hw_addr, g_hw_eip[16], g_hw_cnt[16], g_hw_rw = 1;  /* 1 write, 3 read or write (hwbp <addr> rw); 4 bytes for rw */
 static int g_hw_n;
 /* the callers too: per hit, the first HW_DEPTH values on the stack (0x400 bytes up from ESP, within the thread's stack)
  * that point into Dunia's code, as a chain; up to HW_CHAINS distinct chains are counted */
@@ -415,7 +415,7 @@ static DWORD WINAPI hw_set_threads(void *unused)
         c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if (GetThreadContext(h, &c)) {
             c.Dr0 = g_hw_addr;
-            c.Dr7 = g_hw_addr ? (c.Dr7 & ~0xF0003u) | 0x10001u : c.Dr7 & ~0xF0003u;  /* L0, RW0 = write, LEN0 = 1 byte */
+            c.Dr7 = g_hw_addr ? (c.Dr7 & ~0xF0003u) | (g_hw_rw == 3 ? 0xF0001u : 0x10001u) : c.Dr7 & ~0xF0003u;  /* L0, RW0 = write or read/write, LEN0 = 1 or 4 bytes */
             if (SetThreadContext(h, &c)) n++;
         }
         ResumeThread(h);
@@ -566,6 +566,8 @@ static void native_cmd(const char *ln)
         HANDLE t;
         DWORD set = 0;
         if (a) g_hw_n = g_hw_nchain = 0;  /* clearing keeps the counts for hwlog */
+        g_hw_rw = strstr(ln, " rw") ? 3 : 1;
+        if (g_hw_rw == 3) a &= ~3UL;
         g_hw_addr = a;
         if ((t = CreateThread(NULL, 0, hw_set_threads, NULL, 0, NULL))) { WaitForSingleObject(t, 5000); GetExitCodeThread(t, &set); CloseHandle(t); }
         logf_("hwbp %lx: set on %lu thread(s)%s", a, set, a ? "" : " (cleared)");
@@ -1084,6 +1086,28 @@ static int pawn_use_seat(BYTE *ent, unsigned long long veh, int stype, int seat)
     return 1;
 }
 
+/* Any vehicle's driver input record (cars and boats): the driver input code FUN_100dd9e0 takes the vehicle entity's
+ * component with tag Dunia+0xfde25c (registered by FUN_10042040 when the flag +0xfde248 is 0), asks FUN_100695c0
+ * (thiscall on it) for the controller, and the controller's vtable +0x134 gives the record (float +0 throttle, byte +4
+ * handbrake, byte +5 reverse, float +8 steering), which it fills from the driver. */
+#define RVA_DRVTAG_REG  0x042040
+#define RVA_DRVTAG_FLAG 0xfde248
+#define RVA_DRVTAG      0xfde25c
+#define RVA_DRVCTL      0x0695c0
+typedef BYTE *(__attribute__((thiscall)) *drvctl_t)(void *comp);
+typedef BYTE *(__attribute__((thiscall)) *drvrec_t)(void *ctl);
+
+static BYTE *veh_drv_record(BYTE *ent, BYTE **ctl_out)
+{
+    BYTE *c, *ctl;
+    if (ctl_out) *ctl_out = NULL;
+    if (*(int *)(g_base + RVA_DRVTAG_FLAG) == 0) ((reg_t)(g_base + RVA_DRVTAG_REG))(NULL);
+    c = ((getcomp_t)(g_base + RVA_GETCOMPONENT))(ent, g_base + RVA_DRVTAG);
+    if (!c || !(ctl = ((drvctl_t)(g_base + RVA_DRVCTL))(c)) || IsBadReadPtr(ctl, 4) || IsBadReadPtr(*(BYTE **)ctl + 0x134, 4)) return NULL;
+    if (ctl_out) *ctl_out = ctl;
+    return ((drvrec_t)(*(void ***)ctl)[0x134 / 4])(ctl);
+}
+
 /* vin (vehicle input, h_vehinput below) */
 static BYTE *g_vin_veh;          /* the vehicle object whose input is replaced */
 static BYTE g_vin_rec[12];       /* its record */
@@ -1135,6 +1159,15 @@ static int veh_cmd(const char *ln)
             return 1;
         }
         return 0;
+    }
+    if (sscanf(ln, "vrec %llu", &id) == 1) {
+        BYTE *ctl = NULL, *rec;
+        ent = entity_obj(id, &holder);
+        rec = ent && !IsBadReadPtr(ent, 0x70) ? veh_drv_record(ent, &ctl) : NULL;
+        logf_("vrec %llu: controller %p vtable rva %lx record %p throttle %.2f handbrake %d reverse %d steer %.2f", id, ctl,
+              ctl ? (unsigned long)(*(BYTE **)ctl - g_base) : 0UL, rec, rec ? *(float *)rec : 0.0f, rec ? rec[4] : 0, rec ? rec[5] : 0, rec ? *(float *)(rec + 8) : 0.0f);
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        return 1;
     }
     if (sscanf(ln, "wcomp %llu", &id) == 1) {
         void *wc;
@@ -1780,15 +1813,19 @@ static vehinput_t o_vehinput;
 #define VIN_SEEN 16
 static struct { BYTE *veh; BYTE rec[12]; DWORD t; } g_vin_seen[VIN_SEEN];
 
-/* the chassis motion of a vehicle instance: its chassis rigid body (hkpUnaryAction entity, instance + 0x18) holds
- * its motion at +0xd0: position at motion + 0x40, rotation columns at +0x10/+0x20/+0x30 (+0x20 = forward, local Y),
- * linear velocity +0xd0, angular velocity +0xe0 */
+/* the chassis motion of a vehicle instance: its chassis rigid body (a car's hkpVehicleInstance: hkpUnaryAction entity
+ * at +0x18; a boat object: +0x68) holds its motion at +0xd0: position at motion + 0x40, rotation columns at
+ * +0x10/+0x20/+0x30 (+0x20 = forward, local Y), linear velocity +0xd0, angular velocity +0xe0 */
 static BYTE *inst_motion(BYTE *inst)
 {
-    BYTE *b;
-    if (!inst || IsBadReadPtr(inst + 0x18, 4) || !(b = *(BYTE **)(inst + 0x18)) || IsBadReadPtr(b, 0x1c0)) return NULL;
-    if (*(DWORD *)b != (DWORD)(g_base + RVA_HKRIGIDBODY_VT) || !is_motion_vt(*(DWORD *)(b + 0xd0))) return NULL;
-    return b + 0xd0;
+    static const int offs[2] = { 0x18, 0x68 };
+    int k;
+    for (k = 0; inst && k < 2; k++) {
+        BYTE *b;
+        if (IsBadReadPtr(inst + offs[k], 4) || !(b = *(BYTE **)(inst + offs[k])) || IsBadReadPtr(b, 0x1c0)) continue;
+        if (*(DWORD *)b == (DWORD)(g_base + RVA_HKRIGIDBODY_VT) && is_motion_vt(*(DWORD *)(b + 0xd0))) return b + 0xd0;
+    }
+    return NULL;
 }
 
 /* the vehicle instance seen in the last second whose chassis is nearest pos (within 3 m), or -1 */
@@ -1840,9 +1877,10 @@ static BYTE *veh_record(BYTE *veh)
     return ((vehrec_t)(*(void ***)ctl)[0x134 / 4])(ctl);
 }
 
-static void __attribute__((thiscall)) h_vehinput(void *veh, void *step)
+/* for both kinds of vehicle step: keeps the vehicle's record, and for the body's vehicle puts ours in (and corrects
+ * its motion); vin_post puts the controller's back */
+static int vin_pre(BYTE *veh, BYTE *rec, BYTE *keep)
 {
-    BYTE *rec = veh_record(veh), keep[12];
     int i, swap = rec && veh == g_vin_veh;
     if (rec) {
         for (i = 0; i < VIN_SEEN && g_vin_seen[i].veh && g_vin_seen[i].veh != veh && GetTickCount() - g_vin_seen[i].t < 5000; i++) ;
@@ -1859,7 +1897,31 @@ static void __attribute__((thiscall)) h_vehinput(void *veh, void *step)
         memcpy(keep, rec, 12); memcpy(rec, g_vin_rec, 12);
         if (g_vt_on && (mo = inst_motion(veh))) vt_correct(mo);
     }
+    return swap;
+}
+
+static void __attribute__((thiscall)) h_vehinput(void *veh, void *step)
+{
+    BYTE *rec = veh_record(veh), keep[12];
+    int swap = vin_pre(veh, rec, keep);
     o_vehinput(veh, step);
+    if (swap) memcpy(rec, keep, 12);
+}
+
+/* A boat is not a Havok vehicle instance: its step FUN_104aa970 (thiscall(boat, step), RET 4; called by its Havok
+ * action with the boat at action + 0x1c) reads the same input record from the controller at boat + 0x19c and applies
+ * its forces; the boat's rigid body is at boat + 0x68. Hooked like the car's input step. */
+#define RVA_BOATSTEP 0x4aa970
+typedef void (__attribute__((thiscall)) *boatstep_t)(void *boat, void *step);
+static boatstep_t o_boatstep;
+
+static void __attribute__((thiscall)) h_boatstep(void *boat, void *step)
+{
+    BYTE *ctl = boat && !IsBadReadPtr((BYTE *)boat + 0x19c, 4) ? *(BYTE **)((BYTE *)boat + 0x19c) : NULL, *rec = NULL, keep[12];
+    int swap;
+    if (ctl && !IsBadReadPtr(ctl, 4) && !IsBadReadPtr(*(BYTE **)ctl + 0x134, 4)) rec = ((vehrec_t)(*(void ***)ctl)[0x134 / 4])(ctl);
+    swap = vin_pre(boat, rec, keep);
+    o_boatstep(boat, step);
     if (swap) memcpy(rec, keep, 12);
 }
 
@@ -1933,6 +1995,10 @@ static void install_vehicle_hooks(void)
     void *p;
     if ((p = detour_checked(RVA_SETEULER, seteuler, 6, h_seteuler, "set euler"))) o_seteuler = (seteuler_t)p;
     if ((p = detour_checked(RVA_MOUNTYAW, mountyaw, 6, h_mountyaw, "gun mount yaw"))) o_mountyaw = (mountyaw_t)p;
+    {
+        static const BYTE boatstep[6] = { 0x83, 0xEC, 0x40, 0x56, 0x8B, 0xF1 };  /* SUB ESP,0x40; PUSH ESI; MOV ESI,ECX */
+        if ((p = detour_checked(RVA_BOATSTEP, boatstep, 6, h_boatstep, "boat step"))) o_boatstep = (boatstep_t)p;
+    }
     void **slot = (void **)(g_base + RVA_VEHINPUT_VT);
     DWORD old;
     if (*slot != g_base + RVA_VEHINPUT) { logf_("vehicle hook: unexpected vtable, not installed"); return; }
@@ -2755,8 +2821,12 @@ static int ai_target(DWORD now, float *t)
  * is VDRIVE_SNAP m off. vdrive 0: physics off, placed from the packets every frame. */
 #define VDRIVE_SNAP 6.0f
 static int g_vdrive = 1;
-static DWORD g_vdrive_snap;
+static DWORD g_vdrive_snap, g_vdrive_t0;
 static unsigned g_vdrive_snaps;
+/* a vehicle without a Havok vehicle instance (boats: the input hook never sees them) is placed every frame with its
+ * physics off instead, after VPLACE_AFTER ms without an instance */
+#define VPLACE_AFTER 1000
+static int g_vplace;
 
 /* places a vehicle with its physics on: off, place, on, woken, given a velocity */
 static void veh_snap(BYTE *v, const float *pos, float yaw, const float *vel)
@@ -2798,6 +2868,7 @@ static int ai_drive(DWORD now, const float *t, const float *p)
             g_ai_noveh = g_remote.veh; g_ai_noveh_t = now; return 0;
         }
         g_ai_veh = lid; g_ai_vehsrc = g_remote.veh; g_ai_seated = 0; g_ai_seattries = 0; g_ai_lastseat = 0;
+        g_vdrive_t0 = now; g_vplace = 0;
         g_ai_glide = 0;  /* the glide teleports him onto the peer, into the car */
         snprintf(code, sizeof code, "CDominoManager_GetInstance():SendCommandEventToEntity('%llu', 'MoveToStopped') __out = 'ok'", g_ai_id);
         lua_eval(code, out, sizeof out);
@@ -2817,7 +2888,7 @@ static int ai_drive(DWORD now, const float *t, const float *p)
     if (!drives || (g_net_veh == g_ai_veh && g_net_stype == SEAT_DRIVER)) {
         /* the peer rides, or the local player drives this car: it moves the way this world drives it */
         g_vt_on = 0; g_vin_veh = NULL;
-    } else if (!g_vdrive) {
+    } else if (!g_vdrive || g_vplace) {
         pos[0] = g_remote.vpos[0] + g_ai_vel[0] * lead; pos[1] = g_remote.vpos[1] + g_ai_vel[1] * lead; pos[2] = g_remote.vpos[2];
         ent_place(v, pos, yaw);
     } else {
@@ -2841,6 +2912,12 @@ static int ai_drive(DWORD now, const float *t, const float *p)
         k = veh_instance(m + 12);
         g_vin_veh = k >= 0 ? g_vin_seen[k].veh : NULL;
         g_vt_on = g_vin_veh != NULL;
+        if (!g_vin_veh && now - g_vdrive_t0 > VPLACE_AFTER) {
+            void *ph = ent_physics(v);
+            if (ph) ent_set_physics(ph, 0);
+            g_vplace = 1;
+            logf_("ai: vehicle %llu has no Havok vehicle instance (a boat?), placed every frame with its physics off", g_ai_veh);
+        }
     }
     if (holder) (*(int *)((BYTE *)holder + 8))--;
     /* seating waits for the pawn to have loaded, as the game's VehicleRide box does; CVehicle_GetCurrentVehicle
