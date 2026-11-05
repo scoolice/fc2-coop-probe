@@ -391,6 +391,12 @@ WINBASEAPI PVOID WINAPI AddVectoredExceptionHandler(ULONG, PVECTORED_EXCEPTION_H
  * traps after the writing instruction; the handler only counts the instruction addresses, hwlog prints them. */
 static DWORD g_hw_addr, g_hw_eip[16], g_hw_cnt[16];
 static int g_hw_n;
+/* the callers too: per hit, the first HW_DEPTH values on the stack (0x400 bytes up from ESP, within the thread's stack)
+ * that point into Dunia's code, as a chain; up to HW_CHAINS distinct chains are counted */
+#define HW_DEPTH 8
+#define HW_CHAINS 12
+static DWORD g_hw_chain[HW_CHAINS][HW_DEPTH], g_hw_chaincnt[HW_CHAINS];
+static int g_hw_nchain;
 
 static DWORD WINAPI hw_set_threads(void *unused)
 {
@@ -428,6 +434,17 @@ static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
         for (i = 0; i < g_hw_n && g_hw_eip[i] != eip; i++) ;
         if (i < g_hw_n) g_hw_cnt[i]++;
         else if (g_hw_n < 16) { g_hw_eip[g_hw_n] = eip; g_hw_cnt[g_hw_n++] = 1; }
+        {
+            NT_TIB *tib = (NT_TIB *)NtCurrentTeb();
+            DWORD *sp = (DWORD *)ep->ContextRecord->Esp, *top = (DWORD *)tib->StackBase, ch[HW_DEPTH] = { 0 };
+            DWORD lo = (DWORD)g_base + 0x1000, hi = (DWORD)g_base + 0xe00000;
+            int k = 0, j;
+            for (; sp < top && sp < (DWORD *)ep->ContextRecord->Esp + 0x100 && k < HW_DEPTH; sp++)
+                if (*sp >= lo && *sp < hi) ch[k++] = *sp;
+            for (j = 0; j < g_hw_nchain && memcmp(g_hw_chain[j], ch, sizeof ch) != 0; j++) ;
+            if (j < g_hw_nchain) g_hw_chaincnt[j]++;
+            else if (g_hw_nchain < HW_CHAINS) { memcpy(g_hw_chain[g_hw_nchain], ch, sizeof ch); g_hw_chaincnt[g_hw_nchain++] = 1; }
+        }
         ep->ContextRecord->Dr6 = 0;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -444,6 +461,7 @@ static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
 static BYTE *entity_obj(unsigned long long id, void **holder_out);
 static int ai_cmd(const char *ln);
 static int veh_cmd(const char *ln);
+static void *weapon_comp(BYTE *ent);
 static int wpn_cmd(const char *ln);
 /* exclude: a body to skip (the local player's when binding the avatar: both stand on the same spot
  * after loading the same save, so the nearest body would otherwise be the player's own) */
@@ -547,7 +565,7 @@ static void native_cmd(const char *ln)
     if (sscanf(ln, "hwbp %lx", &a) == 1) {
         HANDLE t;
         DWORD set = 0;
-        if (a) g_hw_n = 0;  /* clearing keeps the counts for hwlog */
+        if (a) g_hw_n = g_hw_nchain = 0;  /* clearing keeps the counts for hwlog */
         g_hw_addr = a;
         if ((t = CreateThread(NULL, 0, hw_set_threads, NULL, 0, NULL))) { WaitForSingleObject(t, 5000); GetExitCodeThread(t, &set); CloseHandle(t); }
         logf_("hwbp %lx: set on %lu thread(s)%s", a, set, a ? "" : " (cleared)");
@@ -555,6 +573,13 @@ static void native_cmd(const char *ln)
         int i;
         logf_("hwlog: %d writer(s)", g_hw_n);
         for (i = 0; i < g_hw_n; i++) logf_("hwlog: after Dunia+0x%lx (%p) x%lu", g_hw_eip[i] - (DWORD)g_base, (void *)g_hw_eip[i], g_hw_cnt[i]);
+        for (i = 0; i < g_hw_nchain; i++) {
+            char line[200];
+            int len = 0, k;
+            for (k = 0; k < HW_DEPTH && g_hw_chain[i][k]; k++) len += sprintf(line + len, " %lx", g_hw_chain[i][k] - (DWORD)g_base);
+            line[len] = 0;
+            logf_("hwlog: stack x%lu:%s", g_hw_chaincnt[i], line);
+        }
     } else if (sscanf(ln, "peek %lx %d", &a, &n) == 2) {
         if (IsBadReadPtr((void *)a, n)) logf_("peek %lx: unreadable", a);
         else hexdump_((const BYTE *)a, n);
@@ -1110,6 +1135,15 @@ static int veh_cmd(const char *ln)
             return 1;
         }
         return 0;
+    }
+    if (sscanf(ln, "wcomp %llu", &id) == 1) {
+        void *wc;
+        ent = entity_obj(id, &holder);
+        wc = ent && !IsBadReadPtr(ent, 0x70) ? weapon_comp(ent) : NULL;
+        logf_("wcomp %llu: entity %p weapon component %p vtable rva %lx fire strategy %p", id, ent, wc,
+              wc ? (unsigned long)(*(BYTE **)wc - g_base) : 0UL, wc && !IsBadReadPtr((BYTE *)wc + 0x10, 4) ? *(void **)((BYTE *)wc + 0x10) : NULL);
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
+        return 1;
     }
     if (strncmp(ln, "aiseat ", 7) == 0) {
         unsigned long long veh;
@@ -1829,8 +1863,76 @@ static void __attribute__((thiscall)) h_vehinput(void *veh, void *step)
     if (swap) memcpy(rec, keep, 12);
 }
 
+/* A mounted gun is its own entity, a child of the vehicle (its matrix is world space, SetEuler / SetPosition work in its
+ * parent's space; a world position given to it put it 2.5 km off). The game turns it each frame with CEntity::SetEuler
+ * from the gun's update (FUN_100a3a80, from the gunner's view angles); its rest pose has its own tilt, so the angles
+ * are copied as the game passes them: h_seteuler records those given to the local player's gun (g_tur_mine) and puts
+ * the peer's into those given to the gun the body sits on (g_tur_peer). */
+typedef void (__attribute__((thiscall)) *seteuler_t)(void *ent, float a, float b, float c);
+static seteuler_t o_seteuler;
+static BYTE *volatile g_tur_mine, *volatile g_tur_peer;
+static volatile int g_tur_on;
+static float g_tur_my[3], g_tur_ang[3];
+static volatile DWORD g_tur_my_t;
+
+static void __attribute__((thiscall)) h_seteuler(void *ent, float a, float b, float c)
+{
+    if (ent && ent == g_tur_mine) { g_tur_my[0] = a; g_tur_my[1] = b; g_tur_my[2] = c; g_tur_my_t = GetTickCount(); }
+    if (ent && ent == g_tur_peer && g_tur_on) { a = g_tur_ang[0]; b = g_tur_ang[1]; c = g_tur_ang[2]; }
+    o_seteuler(ent, a, b, c);
+}
+
+/* The gun's left-right is not the gun entity: the gun's update (FUN_100a3a80, via FUN_100c37c0) calls
+ * FUN_100c2fa0 (thiscall(mount, float *yaw, dt), RET 8), which turns a bone of the vehicle's skeleton by the yaw: bone
+ * name hash at mount + 0x1c, the vehicle as *(*(mount + 0x44) + 8) = its holder (entity at +0xc), and FUN_10152f10 on
+ * mount + 0xc0 (writes +0xd0/+0xd4). The mount's entity is a third child of the vehicle (the ring; Rover: not the car,
+ * not the gun). That runs only from the local player's gun update (FUN_100a4980), never for an AI on the gun, so while
+ * the local player is on a gun every call is its own: h_mountyaw records the yaw, the bone and the mount entity's id
+ * offset from the vehicle's, and the receiver turns its copy's bone by calling it with a mount of its own
+ * (mount_turn). */
+#define RVA_MOUNTYAW 0x0c2fa0
+typedef void (__attribute__((thiscall)) *mountyaw_t)(void *mount, float *yaw, float dt);
+static mountyaw_t o_mountyaw;
+static BYTE *volatile g_yaw_mine;  /* the local player's vehicle entity while on its gun */
+static float g_yaw_my;
+static DWORD g_yaw_mybone;
+static unsigned long long g_yaw_myent;  /* the mount entity's id */
+static volatile DWORD g_yaw_my_t;
+static volatile LONG g_yaw_calls;
+
+static void __attribute__((thiscall)) h_mountyaw(void *mount, float *yaw, float dt)
+{
+    BYTE *x = mount && !IsBadReadPtr((BYTE *)mount + 0x44, 4) ? *(BYTE **)((BYTE *)mount + 0x44) : NULL;
+    BYTE *h = x && !IsBadReadPtr(x + 8, 4) ? *(BYTE **)(x + 8) : NULL;
+    BYTE *ve = h && !IsBadReadPtr(h + 0xc, 4) ? *(BYTE **)(h + 0xc) : NULL;
+    if (InterlockedIncrement(&g_yaw_calls) <= 3)
+        logf_("mount yaw: mount %p entity %p (local car %p, local gun %p) yaw %.3f bone %08lx calls %ld", mount, ve, g_yaw_mine, g_tur_mine,
+              yaw ? *yaw : 0.0f, mount ? *(DWORD *)((BYTE *)mount + 0x1c) : 0UL, g_yaw_calls);
+    if (ve && g_yaw_mine && yaw && !IsBadReadPtr(ve + 8, 8)) {
+        g_yaw_my = *yaw; g_yaw_mybone = *(DWORD *)((BYTE *)mount + 0x1c); g_yaw_myent = *(unsigned long long *)(ve + 8); g_yaw_my_t = GetTickCount();
+    }
+    o_mountyaw(mount, yaw, dt);
+}
+
+/* turns the gun mount bone of a vehicle (by its holder) by a yaw, through the game's own mount code */
+static void mount_turn(BYTE *holder, DWORD bone, float yaw)
+{
+    static BYTE m[0x100], x[0x10];
+    if (!o_mountyaw || !holder || !bone) return;
+    memset(m, 0, sizeof m); memset(x, 0, sizeof x);
+    *(DWORD *)(m + 0x1c) = bone;
+    *(BYTE **)(m + 0x44) = x;
+    *(BYTE **)(x + 8) = holder;
+    o_mountyaw(m, &yaw, 0.033f);
+}
+
 static void install_vehicle_hooks(void)
 {
+    static const BYTE seteuler[6] = { 0x6A, 0x00, 0x8D, 0x44, 0x24, 0x08 };  /* PUSH 0; LEA EAX,[ESP+8] */
+    static const BYTE mountyaw[6] = { 0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0 };  /* PUSH EBP; MOV EBP,ESP; AND ESP,-16 */
+    void *p;
+    if ((p = detour_checked(RVA_SETEULER, seteuler, 6, h_seteuler, "set euler"))) o_seteuler = (seteuler_t)p;
+    if ((p = detour_checked(RVA_MOUNTYAW, mountyaw, 6, h_mountyaw, "gun mount yaw"))) o_mountyaw = (mountyaw_t)p;
     void **slot = (void **)(g_base + RVA_VEHINPUT_VT);
     DWORD old;
     if (*slot != g_base + RVA_VEHINPUT) { logf_("vehicle hook: unexpected vtable, not installed"); return; }
@@ -2101,12 +2203,14 @@ static void hold_tick(void)
  * (throttle, steering) with vflags VEH_HANDBRAKE / VEH_REVERSE / VEH_INPUT (vrec valid); vvel, vwz: the vehicle's
  * linear velocity and yaw rate; vseat, vstype: the sender's seat in it and its type (SEAT_DRIVER ...), -1 / 0 unknown */
 typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; unsigned long long veh; float vpos[3]; float vfwd[2]; char wpn[48]; unsigned shots; float aim[3]; unsigned flags; float look[3]; unsigned jumps; float mv[2];
-                 float vrec[2]; unsigned vflags; float vvel[3]; float vwz; int vseat, vstype; } NetPkt;
+                 float vrec[2]; unsigned vflags; float vvel[3]; float vwz; int vseat, vstype; float vtur[3]; float vyaw; unsigned vbone; int vmountoff; } NetPkt;
 #pragma pack(pop)
-#define NET_MAGIC 0x43324346u
+#define NET_MAGIC 0x47324346u
 #define VEH_HANDBRAKE 1u
 #define VEH_REVERSE 2u
 #define VEH_INPUT 4u
+#define VEH_TURRET 8u  /* vtur: the angles the game gave the sender's mounted gun (SetEuler); vyaw its mount's yaw */
+#define VEH_TURYAW 16u
 #define NET_DEAD 1u
 #define NET_AIMING 2u
 #define NET_FLAME 4u
@@ -2283,6 +2387,10 @@ static unsigned g_ai_spawns, g_ai_stuck;
 static unsigned long long g_ai_veh, g_ai_noveh, g_ai_vehsrc;  /* g_ai_vehsrc: the peer's id of g_ai_veh */
 static DWORD g_ai_noveh_t;  /* when g_ai_noveh was set; looked for again after 10 s */
 static int g_ai_seat = -1;  /* the seat the body was put in */
+/* the body sits on a mounted gun: an AI put in a gunner seat holds the vehicle's gun (vehicle id + 512) as its weapon in
+ * hand, which fires through the same bullet code as a gun; the peer on the gun holds weapons.MountedWeapons.* */
+static int g_ai_turret;
+
 static int g_ai_seated, g_ai_seattries;
 static DWORD g_ai_lastseat;
 /* the peer's weapon on our body: one spawned weapon entity per category, and what the body last got */
@@ -2309,7 +2417,7 @@ static void ai_vehicle_release(void)
 {
     void *holder = NULL, *phys;
     BYTE *v;
-    g_vt_on = 0; g_vin_veh = NULL; g_ai_vehsrc = 0; g_ai_seat = -1;
+    g_vt_on = 0; g_vin_veh = NULL; g_ai_vehsrc = 0; g_ai_seat = -1; g_ai_turret = 0; g_tur_on = 0; g_tur_peer = NULL;
     if (!g_ai_veh) return;
     v = entity_obj(g_ai_veh, &holder);
     if (v && (phys = ent_physics(v))) ent_set_physics(phys, 1);
@@ -2607,7 +2715,7 @@ static void ai_shoot(DWORD now)
     unsigned d = g_remote.shots - g_ai_shots;
     if (!g_ai_shots_on || d > 1000) { g_ai_shots = g_remote.shots; g_ai_shots_on = 1; g_ai_pend = 0; return; }
     g_ai_shots = g_remote.shots;
-    if (strcmp(g_ai_wpn, g_remote.wpn) != 0 || !g_ai_wpn[0]) { g_ai_pend = 0; return; }
+    if (!g_ai_turret && (strcmp(g_ai_wpn, g_remote.wpn) != 0 || !g_ai_wpn[0])) { g_ai_pend = 0; return; }
     g_ai_pend += d;
     if (g_ai_pend > 5) g_ai_pend = 5;
     ent = entity_obj(g_ai_id, &holder);
@@ -2780,9 +2888,32 @@ static int ai_drive(DWORD now, const float *t, const float *p)
         }
         if (!g_ai_seated && ++g_ai_seattries == 6) logf_("ai: body still not seated after 6 tries (%s, seat %d)", out, veh_seat_of(v, g_ai_id, NULL));
     }
+    /* the peer on the gun: its shots go out of our copy's gun, aimed along its camera */
+    if ((g_ai_turret = !drives && g_ai_seated && g_remote.vstype == SEAT_GUNNER)) {
+        void *th = NULL, *tpc;
+        BYTE *te = entity_obj(g_ai_id, &th);
+        ai_shoot(now);
+        tpc = te && !IsBadReadPtr(te, 0x70) ? pawn_comp(te) : NULL;
+        g_tur_peer = tpc ? weapon_held(tpc) : NULL;
+        if (th) (*(int *)((BYTE *)th + 8))--;
+        if (g_remote.vflags & VEH_TURYAW) {
+            /* this holder lookup holds a reference over the call */
+            void *vh = NULL;
+            if (entity_obj(g_ai_veh + g_remote.vmountoff, &vh) && vh) mount_turn(vh, g_remote.vbone, g_remote.vyaw);
+            if (vh) (*(int *)((BYTE *)vh + 8))--;
+        }
+        if (g_tur_peer && o_seteuler && (g_remote.vflags & VEH_TURRET)) {
+            memcpy(g_tur_ang, g_remote.vtur, sizeof g_tur_ang);
+            g_tur_on = 1;
+            o_seteuler(g_tur_peer, g_tur_ang[0], g_tur_ang[1], g_tur_ang[2]);  /* in case the game does not turn an AI's gun */
+        } else g_tur_on = 0;
+    } else { g_tur_on = 0; g_tur_peer = NULL; }
     if (now - g_ai_lastlog >= 1000) {
         g_ai_lastlog = now;
         d = sqrtf((t[0] - p[0]) * (t[0] - p[0]) + (t[1] - p[1]) * (t[1] - p[1]));
+        if (g_ai_turret) logf_("ai: gun: angles %s %.2f %.2f %.2f, mount yaw %s %.2f bone %08x mount entity +%d, mount calls %ld", (g_remote.vflags & VEH_TURRET) ? "in" : "none",
+                               g_remote.vtur[0], g_remote.vtur[1], g_remote.vtur[2], (g_remote.vflags & VEH_TURYAW) ? "in" : "none", g_remote.vyaw, g_remote.vbone,
+                               g_remote.vmountoff, g_yaw_calls);
         logf_("ai: target (%.2f %.2f %.2f) pawn (%.2f %.2f %.2f) dist %.2f orders %u tps %u glide %u veh %llu seated %d car %.2f m off, input %s (throttle %.2f steer %.2f) snaps %u",
               t[0], t[1], t[2], p[0], p[1], p[2], d, g_ai_orders, g_ai_tps, g_ai_glides, g_ai_veh, g_ai_seated, err,
               g_vin_veh ? "replayed" : "-", g_remote.vrec[0], g_remote.vrec[1], g_vdrive_snaps);
@@ -3290,6 +3421,10 @@ static void net_tick(void)
             p.jumps = (unsigned)g_jumps;
             if (pd) { p.mv[0] = *(float *)(pd + 0x140 + 0xb0); p.mv[1] = *(float *)(pd + 0x140 + 0xb4); }
         }
+        {
+            void *tpc = obj && !strncmp(g_net_wpn, "weapons.MountedWeapons", 22) ? pawn_comp(obj) : NULL;
+            g_tur_mine = tpc ? weapon_held(tpc) : NULL;
+        }
         if (g_flame) {  /* a weapon switch may not pass through StopShoot */
             void *fpc = obj ? pawn_comp(obj) : NULL, *fs = fpc ? held_strategy(fpc) : NULL;
             if (!fs || *(BYTE **)fs != g_base + RVA_FLAMESTRAT_VT) { g_flame = 0; logf_("net: local flamethrower off (no longer in hand)"); }
@@ -3300,6 +3435,13 @@ static void net_tick(void)
             p.veh = g_net_veh;
             p.vseat = veh_seat_of(obj, g_net_id, &p.vstype);
             g_net_seat = p.vseat; g_net_stype = p.vstype;
+            /* the last angles while on the gun: a copy in the background (two on one PC) does not run the gun's update */
+            if (p.vstype == SEAT_GUNNER && g_tur_mine && g_tur_my_t) { memcpy(p.vtur, g_tur_my, sizeof p.vtur); p.vflags |= VEH_TURRET; }
+            if (p.vstype != SEAT_GUNNER) g_tur_my_t = g_yaw_my_t = 0;
+            g_yaw_mine = p.vstype == SEAT_GUNNER ? obj : NULL;
+            if (g_yaw_mine && g_yaw_my_t) {
+                p.vyaw = g_yaw_my; p.vbone = g_yaw_mybone; p.vmountoff = (int)(g_yaw_myent - g_net_veh); p.vflags |= VEH_TURYAW;
+            }
             memcpy(p.vpos, obj + 0x60, sizeof p.vpos);
             p.vfwd[0] = *(float *)(obj + 0x40); p.vfwd[1] = *(float *)(obj + 0x44);
             {
@@ -3308,7 +3450,7 @@ static void net_tick(void)
                 if (k >= 0) {
                     BYTE *r = g_vin_seen[k].rec;
                     p.vrec[0] = *(float *)r; p.vrec[1] = *(float *)(r + 8);
-                    p.vflags = VEH_INPUT | (r[4] ? VEH_HANDBRAKE : 0) | (r[5] ? VEH_REVERSE : 0);
+                    p.vflags |= VEH_INPUT | (r[4] ? VEH_HANDBRAKE : 0) | (r[5] ? VEH_REVERSE : 0);
                 }
                 if (mo) { memcpy(p.vvel, mo + 0xd0, sizeof p.vvel); p.vwz = *(float *)(mo + 0xe8); }
             }

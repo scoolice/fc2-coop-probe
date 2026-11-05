@@ -350,6 +350,19 @@ side first. Two copies, the owner driving A's Rover with B's player on B's gun: 
 sat a median 0.52 m from where B's player is, B's Rover stayed a median 0.64 m from A's. No entry animation on those
 seats yet. Test commands: `vseats <vehicle>`, `vmap <x> <y> <z>`, `aiseat <pawn> <vehicle> <seat type> [seat]`.
 
+**Mounted guns (packet `FC2G`).** On a mounted gun the gun is the gunner's weapon in hand (an entity, vehicle id + 512)
+and fires through the same bullet code as a hand gun, so the peer's turret rounds are counted and sent like bullets;
+the body on our copy's gun fires them from it. The gun is turned in two parts, both only by the player's gun update
+(FUN_100a4980 -> FUN_100a3a80), never for an AI gunner: up and down with `CEntity::SetEuler` on the gun entity (a child
+of the vehicle, so its angles are in the vehicle's space and its rest pose has its own tilt), left and right through
+FUN_100c2fa0, which turns a bone of the vehicle's skeleton (bone hash at mount + 0x1c) under a third child entity, the
+ring (vehicle id + 256). Detours on both record what the game passes for the local player's gun; the receiver puts the
+peer's angles into `SetEuler` for its gun and calls the mount code with a mount object of its own for its ring. The
+last angles are kept while the sender stays on the gun (a copy in the background does not run the gun's update).
+`hwlog` now also lists the call stacks (Dunia return addresses on the stack) of each write, which found both paths.
+Two copies: the body's gun on B follows the owner's aim on A in both axes and fires with it ("Thats working great
+now"), also while the owner drives B's car. Not checked yet: damage from those rounds, B's player as the gunner.
+
 ### Driven legs
 
 Packet magic `FC2A`. The player's movement code ends by writing its desired movement into the control block (+0xb0/+0xb4/+0xb8, world m/s; FUN_10143de0), and the pawn's locomotion follows it with its own walk, run and sprint animations; an AI pawn does too (one copy, `ctl <Frank> move`: 1.5 m/s walked at ~1.5, 3.8 ran at ~3.6, 7.9 sprinted at ~7.4, stopping within 0.7 m). The sender sends its own; the body's copy, on foot, writes the peer's movement plus a pull toward the peer's position (1.2 per second, at most 4 m/s) into the body's block on each update, and holds MoveTo (`MoveToStopped` instead). The 10 m teleport, the glide and the vehicle seat stay; on foot the glide starts only above 12 m/s (a sprint's first burst is 8.9 m/s, above the default `aiglide` 8). The sprint flag is the write block's bit (set by the key) or the read block's (+0x2d0, kept by the movement code for the rest of the sprint). `aidrive 0` goes back to the MoveTo follower.
